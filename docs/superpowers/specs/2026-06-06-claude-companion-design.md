@@ -23,7 +23,28 @@ Clawd Mochi 当前是一个独立的 ESP32-C3 桌面摆件——能显示眼睛�
 - 不做物理按键/触摸传感器（保留软件控制即可）
 - 不做蜂鸣器（用户没有该硬件）
 - 不做 OTA（手动 USB 烧录仍然是开发流程）
-- 不替换现有 4 种视图（Normal Eyes / Squish Eyes / Claude Code / Canvas），而是**新增**第 5 种 Status 视图
+- **不修改原有 `clawd_mochi/clawd_mochi.ino` 固件**——新版作为**独立的并行项目**存在，用户可以选择烧录原版或新版
+
+### 仓库布局变化
+
+```
+clawd-mochi/
+├── clawd_mochi/                  ← 原版固件（保持不变）
+│   └── clawd_mochi.ino
+├── clawd_mochi_companion/        ← ⭐ 新版固件（本设计的产物）
+│   └── clawd_mochi_companion.ino
+├── clawd-daemon/                 ← ⭐ Python daemon（本设计的产物）
+│   └── ...
+├── models/                       ← 3D 模型（共用，外壳一样）
+└── docs/superpowers/specs/
+    └── 2026-06-06-claude-companion-design.md   ← 本文档
+```
+
+**两个版本完全独立**：
+- 原版 = 纯摆件，AP 模式，手机直连控制（README 现有体验）
+- 新版 = 桌面伙伴，AP+STA 双模，接 Claude Code
+
+用户在 Arduino IDE 里**打开哪个 .ino 就烧哪个**，互不干扰。3D 外壳通用。
 
 ---
 
@@ -125,9 +146,9 @@ Clawd Mochi 当前是一个独立的 ESP32-C3 桌面摆件——能显示眼睛�
 
 ## 4. 组件设计
 
-### 4.1 ESP32 固件（`clawd_mochi/clawd_mochi.ino`）
+### 4.1 ESP32 固件（`clawd_mochi_companion/clawd_mochi_companion.ino`）
 
-保持单文件原则（README 明确要求新手友好），但内部用清晰的逻辑分区：
+**新建文件**，从原版 `clawd_mochi/clawd_mochi.ino` 复制作为起点（保留所有原有视图和动画代码），然后追加新功能。保持单文件原则（README 明确要求新手友好），但内部用清晰的逻辑分区：
 
 ```cpp
 // === 配置 ===
@@ -155,6 +176,8 @@ struct ClaudeStatus {
 };
 
 // === 视图系统 ===
+// 原有 4 个视图代码从 clawd_mochi.ino 全部复制保留
+// 新增 VIEW_STATUS 作为第 5 个视图
 enum View { VIEW_EYES_NORMAL, VIEW_EYES_SQUISH, VIEW_CODE, VIEW_DRAW, VIEW_STATUS };
 //   每个视图一个 draw 函数，已有 4 个，新增 drawStatusView()
 
@@ -352,7 +375,8 @@ CREATE TABLE tool_events (
 ### 用户首次安装流程
 
 ```
-1. 烧录新版 .ino 固件到 ESP32
+1. 在 Arduino IDE 打开 clawd_mochi_companion/clawd_mochi_companion.ino 烧录到 ESP32
+   （原版 clawd_mochi/clawd_mochi.ino 不动；想回到原版随时可以重新烧）
 2. ESP32 启动 → 显示 "Connect to ClaWD-Mochi WiFi"
 3. 用户手机连 ClaWD-Mochi 热点 → 浏览器打开 192.168.4.1
 4. 点 ⚙️ WiFi → 扫描 → 选家里 WiFi → 输密码 → 保存
@@ -435,6 +459,7 @@ model_token_limits = { sonnet = 200000, opus = 200000, haiku = 200000 }
 
 虽然设计一次性完成，实际开发可以按以下顺序，每步独立可用：
 
+0. **建立并行项目骨架**：创建 `clawd_mochi_companion/` 目录，把原版 `clawd_mochi.ino` 复制为 `clawd_mochi_companion.ino` 作为起点；创建 `clawd-daemon/` 目录
 1. **基础设施**：ESP32 多 WiFi 支持 + AP/STA 双模 + 配网页面
 2. **Daemon 骨架**：FastAPI 接收 hook 事件 + 写日志（不推 ESP32）
 3. **状态显示**：Status 视图 + 状态机 + ESP32 接收 status API
@@ -449,7 +474,8 @@ model_token_limits = { sonnet = 200000, opus = 200000, haiku = 200000 }
 
 | 风险 | 评估 | 缓解 |
 |------|------|------|
-| 单文件 .ino 变得太大（当前 48KB） | 中等 | 用清晰分区注释，必要时拆出 .h（但 README 要求单文件友好）|
+| 新文件 .ino 体积超过原版 48KB | 中等 | 用清晰分区注释；预计 ~80-100KB，ESP32-C3 4MB Flash 足够 |
+| 两份固件代码重复（复制原版作起点） | 低 | 接受重复，换来"原版永不变"的简洁性；如要同步 bugfix 手动 cherry-pick |
 | ESP32-C3 内存 400KB，Web UI 字符串占用大 | 低 | Status 视图复用现有绘图函数，避免新增大字符串 |
 | Hook 每次调 curl 有少许开销（~10ms） | 低 | 用户感知不到，比启动 Python 子进程快得多 |
 | Daemon 跨平台启动（mac launchd / Linux systemd） | 中等 | 提供两套模板 + `install` 命令自动选择 |

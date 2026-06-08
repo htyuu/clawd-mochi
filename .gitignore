@@ -23,3 +23,16 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+
+# Python (clawd-daemon)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/

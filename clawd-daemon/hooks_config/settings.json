@@ -1,0 +1,54 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sX POST http://127.0.0.1:7878/event/pre_tool -H 'Content-Type: application/json' -d @-"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sX POST http://127.0.0.1:7878/event/post_tool -H 'Content-Type: application/json' -d @-"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sX POST http://127.0.0.1:7878/event/stop -H 'Content-Type: application/json' -d @-"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sX POST http://127.0.0.1:7878/event/notification -H 'Content-Type: application/json' -d @-"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sX POST http://127.0.0.1:7878/event/prompt -H 'Content-Type: application/json' -d @-"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -23,14 +23,14 @@ def count_tokens(
     claude_dir: Path,
     session_id: str | None,
     model: str = "sonnet",
-) -> tuple[int, int]:
-    """Return (tokens_used, tokens_max) for the session, or (0, 200k) on miss."""
+) -> tuple[int, int, str]:
+    """Return (tokens_used, tokens_max, model_name) for the session."""
     if not session_id:
-        return 0, 200_000
+        return 0, 200_000, model
 
     transcript_dir = claude_dir / "sessions"
     if not transcript_dir.exists():
-        return 0, 200_000
+        return 0, 200_000, model
 
     # Look up the model's context limit (we'll override from the file if we
     # encounter a model stanza).  The caller passes the *default* model;
@@ -38,6 +38,7 @@ def count_tokens(
     from clawd_daemon.config import DEFAULT_MODEL_LIMITS  # noqa: PLC0415
 
     tokens_max = DEFAULT_MODEL_LIMITS.get(model, 200_000)
+    detected_model = model
 
     candidates = [
         transcript_dir / f"{session_id}.jsonl",
@@ -84,10 +85,15 @@ def count_tokens(
                 obj.get("model", "")                     # raw API
             )
             if model_from_file:
-                limit = DEFAULT_MODEL_LIMITS.get(
-                    model_from_file.lower(), tokens_max
-                )
-                tokens_max = limit
+                # Try to extract the model family short name (sonnet/opus/haiku)
+                mf = model_from_file.lower()
+                for short in ("sonnet", "opus", "haiku"):
+                    if short in mf:
+                        detected_model = short
+                        tokens_max = DEFAULT_MODEL_LIMITS.get(short, tokens_max)
+                        break
+                else:
+                    detected_model = mf
 
             usage = obj.get("message", {}).get("usage", {})
             if not usage:
@@ -98,11 +104,11 @@ def count_tokens(
             total_cache_write += usage.get("cache_creation_input_tokens", 0)
 
         grand = total_in + total_out + total_cache_read + total_cache_write
-        return grand, tokens_max
+        return grand, tokens_max, detected_model
 
     if not matched:
         log.debug("no transcript file found for session %s", session_id)
-    return 0, tokens_max
+    return 0, tokens_max, detected_model
 
 
 def find_latest_session_id(claude_dir: Path) -> str | None:

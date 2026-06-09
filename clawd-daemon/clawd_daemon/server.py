@@ -33,6 +33,9 @@ class Daemon:
         self._current_session: str = ""
         self._working_dir: str = ""
         self._tool_start_ts: float = 0.0
+        self._session_start_ts: float = 0.0
+        self._tool_count: int = 0
+        self._current_model: str = ""
 
         # Attempt to discover the running session at boot
         self._discover_session()
@@ -62,10 +65,18 @@ class Daemon:
         # Git info
         gi = git_info.collect(cwd or self._working_dir)
 
-        # Token count
-        used, tmax = token_counter.count_tokens(
+        # Track session start + tool count
+        if self._session_start_ts == 0.0:
+            self._session_start_ts = time.time()
+        self._tool_count += 1
+
+        # Token count + model
+        used, tmax, model = token_counter.count_tokens(
             self.cfg.claude_dir, self._current_session
         )
+        if model:
+            self._current_model = model
+        sdur = int(time.time() - self._session_start_ts) if self._session_start_ts > 0 else 0
 
         new_status = ClaudeStatus(
             state=ClaudeState.THINKING,
@@ -76,6 +87,9 @@ class Daemon:
             tokens_max=tmax,
             git_branch=gi.branch,
             project=gi.project,
+            model=self._current_model,
+            session_duration_s=sdur,
+            tool_count=self._tool_count,
         )
         changed = self.state.apply(new_status)
         if changed or tool:
@@ -98,11 +112,12 @@ class Daemon:
             session=self._current_session,
         )
 
-        used, tmax = token_counter.count_tokens(
+        used, tmax, _ = token_counter.count_tokens(
             self.cfg.claude_dir, self._current_session
         )
         cwd = payload.get("cwd", "") or self._working_dir
         gi = git_info.collect(cwd) if cwd else self.state.status
+        sdur = int(time.time() - self._session_start_ts) if self._session_start_ts > 0 else 0
 
         new_status = ClaudeStatus(
             state=ClaudeState.ERROR if err else ClaudeState.IDLE,
@@ -113,6 +128,9 @@ class Daemon:
             tokens_max=tmax,
             git_branch=gi.branch if hasattr(gi, "branch") else "",
             project=gi.project if hasattr(gi, "project") else "",
+            model=self._current_model,
+            session_duration_s=sdur,
+            tool_count=self._tool_count,
         )
         changed = self.state.apply(new_status)
         if changed:
@@ -120,13 +138,17 @@ class Daemon:
 
     async def on_stop(self, payload: dict) -> None:
         """Claude Code finished the current run."""
-        used, tmax = token_counter.count_tokens(
+        used, tmax, _ = token_counter.count_tokens(
             self.cfg.claude_dir, self._current_session
         )
+        sdur = int(time.time() - self._session_start_ts) if self._session_start_ts > 0 else 0
         new_status = ClaudeStatus(
             state=ClaudeState.DONE,
             tokens_used=used,
             tokens_max=tmax,
+            model=self._current_model,
+            session_duration_s=sdur,
+            tool_count=self._tool_count,
         )
         changed = self.state.apply(new_status)
         if changed:
@@ -143,8 +165,11 @@ class Daemon:
             await self._push(force=True)
 
     async def on_prompt(self, payload: dict) -> None:
-        """User submitted a prompt (reset duration)."""
+        """User submitted a prompt (reset duration + session counters)."""
         self._tool_start_ts = time.time()
+        if self._session_start_ts == 0.0:
+            self._session_start_ts = time.time()
+        self._tool_count = 0
         new_status = ClaudeStatus(state=ClaudeState.IDLE)
         self.state.apply(new_status)
 

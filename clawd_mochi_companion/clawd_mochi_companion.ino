@@ -33,6 +33,8 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <DNSServer.h>      // Captive portal
+#include <ArduinoOTA.h>     // OTA wireless update
 
 // ── Pins ──────────────────────────────────────────────────────
 #define TFT_CS  4
@@ -53,6 +55,10 @@ WiFiMulti wifiMulti;
 Preferences prefs;            // NVS storage
 uint32_t lastWifiScanMs = 0;
 #define WIFI_SCAN_INTERVAL_MS 300000UL   // 5 min: rescan + reconnect to strongest
+
+// Captive portal — DNS that resolves anything to AP IP
+DNSServer dnsServer;
+#define DNS_PORT 53
 
 // ── Mood-light colours (per Claude state) ─────────────────────
 // Filled at boot in initColours(). RGB565.
@@ -80,6 +86,7 @@ uint16_t C_ORANGE, C_DARKBG, C_MUTED, C_GREEN;
 #define VIEW_CODE        2
 #define VIEW_DRAW        3
 #define VIEW_STATUS      4   // NEW: shows Claude work status
+#define VIEW_SCREENSAVER 5   // NEW: day/night cycle screensaver
 
 uint8_t  currentView  = VIEW_EYES_NORMAL;
 uint8_t  previousView = VIEW_EYES_NORMAL;  // for auto-switch revert
@@ -109,20 +116,35 @@ struct ClaudeStatus {
   uint32_t tokens_max;
   String   git_branch;
   String   project;
+  String   model;         // "sonnet" / "opus" / "haiku"
+  uint32_t session_duration_s; // total session wall-clock time
+  uint16_t tool_count;        // tool call count this session
   uint32_t last_update_ms;  // for daemon-offline detection
 };
 
 ClaudeStatus claudeStatus = {
-  CS_IDLE, "", "", 0, 0, 200000, "", "", 0
+  CS_IDLE, "", "", 0, 0, 200000, "", "", "", 0, 0, 0
 };
 
 bool     moodLightEnabled = true;   // toggle from Web UI
 bool     autoSwitchEnabled = true;  // auto switch to Status on important events
+
+// Pending lower-priority status (for priority merging)
+ClaudeStatus pendingStatus;
+bool        hasPendingStatus = false;
+
 uint32_t errorStartMs    = 0;
 uint32_t doneStartMs     = 0;
 #define  ERROR_TIMEOUT_MS 5000
 #define  DONE_TIMEOUT_MS  3000
 #define  DAEMON_OFFLINE_TIMEOUT_MS 60000UL
+
+// Screensaver / idle
+#define SCREENSAVER_TIMEOUT_MS 120000UL  // 2 min
+uint32_t lastInteractionMs = 0;
+uint8_t  idleExpression    = 0;   // 0=normal 1=sleepy 2=puzzled 3=happy
+uint32_t lastExpressionChangeMs = 0;
+#define EXPRESSION_INTERVAL_MS 15000UL  // 15s between expression changes
 
 // Daily stats (cached from daemon)
 struct DailyStats {
@@ -437,60 +459,87 @@ void drawStatusEyes(int16_t centreY) {
   const int16_t lx = (DISP_W - eW * 2 - gap) / 2;
   const int16_t rx = lx + eW + gap;
   const int16_t ey = centreY - eH / 2;
-  uint16_t fg = textOn(moodColor(claudeStatus.state));
+  uint16_t bg = moodColor(claudeStatus.state);
+  uint16_t fg = textOn(bg);
 
   switch (claudeStatus.state) {
     case CS_IDLE: {
-      // Slow blink — every ~3 sec close briefly
-      bool blink = (animFrame % 60) < 4;
-      if (blink) {
-        tft.fillRect(lx, ey + eH/2 - 3, eW, 6, fg);
-        tft.fillRect(rx, ey + eH/2 - 3, eW, 6, fg);
-      } else {
-        tft.fillRect(lx, ey, eW, eH, fg);
-        tft.fillRect(rx, ey, eW, eH, fg);
+      // Expression rotation (4 moods)
+      switch (idleExpression) {
+        case 0: { // normal — slow blink
+          bool blink = (animFrame % 60) < 4;
+          if (blink) {
+            tft.fillRect(lx, ey + eH/2 - 3, eW, 6, fg);
+            tft.fillRect(rx, ey + eH/2 - 3, eW, 6, fg);
+          } else {
+            tft.fillRect(lx, ey, eW, eH, fg);
+            tft.fillRect(rx, ey, eW, eH, fg);
+          }
+          break;
+        }
+        case 1: { // sleepy — half-closed droopy eyes
+          tft.fillRect(lx, ey + eH/2 - 4, eW, 8, fg);
+          tft.fillRect(rx, ey + eH/2 - 4, eW, 8, fg);
+          // tiny slit of pupil
+          tft.drawFastHLine(lx + 4, ey + eH/2 - 1, eW - 8, bg);
+          tft.drawFastHLine(rx + 4, ey + eH/2 - 1, eW - 8, bg);
+          break;
+        }
+        case 2: { // puzzled — one eye bigger
+          tft.fillRect(lx, ey + 6, eW, eH - 12, fg);
+          tft.fillRect(rx, ey, eW, eH, fg);
+          // pupils looking up-left
+          tft.fillCircle(lx + eW/2 - 3, ey + eH/2 - 4, 4, bg);
+          tft.fillCircle(rx + eW/2 - 3, ey + eH/2 - 4, 5, bg);
+          break;
+        }
+        case 3: { // happy — squint > <
+          const int16_t cy = ey + eH/2;
+          const int16_t arm = eH / 2 - 10, reach = eW / 2;
+          for (int8_t t = -3; t <= 3; t++) {
+            tft.drawLine(lx + reach, cy - arm + t, lx, cy + t, fg);
+            tft.drawLine(lx, cy + t, lx + reach, cy + arm + t, fg);
+            tft.drawLine(rx, cy - arm + t, rx + reach, cy + t, fg);
+            tft.drawLine(rx + reach, cy + t, rx, cy + arm + t, fg);
+          }
+          break;
+        }
       }
       break;
     }
     case CS_THINKING: {
-      // Eyes look around in a circular pattern (offset every frame)
       const int16_t ox = 4 * cos(animFrame * 0.3);
       const int16_t oy = 3 * sin(animFrame * 0.3);
       tft.fillRect(lx, ey, eW, eH, fg);
       tft.fillRect(rx, ey, eW, eH, fg);
-      // pupil dot moves
-      uint16_t bg = moodColor(claudeStatus.state);
       tft.fillCircle(lx + eW/2 + ox, ey + eH/2 + oy, 5, bg);
       tft.fillCircle(rx + eW/2 + ox, ey + eH/2 + oy, 5, bg);
       break;
     }
     case CS_AWAITING: {
-      // Flashing wide-open eyes (alternating colours to demand attention)
       uint16_t c = (animFrame % 10) < 5 ? fg : C_WHITE;
       tft.fillRect(lx - 2, ey - 2, eW + 4, eH + 4, c);
       tft.fillRect(rx - 2, ey - 2, eW + 4, eH + 4, c);
       break;
     }
     case CS_DONE: {
-      // Happy squint: > <  in the contrast colour
       const int16_t cy = ey + eH/2;
       const int16_t arm = eH / 2 - 6, reach = eW / 2;
       for (int8_t t = -4; t <= 4; t++) {
-        tft.drawLine(lx + reach,    cy - arm + t, lx,         cy + t,      fg);
-        tft.drawLine(lx,            cy + t,       lx + reach, cy + arm + t, fg);
-        tft.drawLine(rx,            cy - arm + t, rx + reach, cy + t,      fg);
-        tft.drawLine(rx + reach,    cy + t,       rx,         cy + arm + t, fg);
+        tft.drawLine(lx + reach, cy - arm + t, lx, cy + t, fg);
+        tft.drawLine(lx, cy + t, lx + reach, cy + arm + t, fg);
+        tft.drawLine(rx, cy - arm + t, rx + reach, cy + t, fg);
+        tft.drawLine(rx + reach, cy + t, rx, cy + arm + t, fg);
       }
       break;
     }
     case CS_ERROR: {
-      // X-shaped dead eyes
       const int16_t cy = ey + eH/2;
       for (int8_t t = -3; t <= 3; t++) {
-        tft.drawLine(lx,          ey + t,         lx + eW,    ey + eH + t, fg);
-        tft.drawLine(lx + eW,     ey + t,         lx,         ey + eH + t, fg);
-        tft.drawLine(rx,          ey + t,         rx + eW,    ey + eH + t, fg);
-        tft.drawLine(rx + eW,     ey + t,         rx,         ey + eH + t, fg);
+        tft.drawLine(lx, ey + t, lx + eW, ey + eH + t, fg);
+        tft.drawLine(lx + eW, ey + t, lx, ey + eH + t, fg);
+        tft.drawLine(rx, ey + t, rx + eW, ey + eH + t, fg);
+        tft.drawLine(rx + eW, ey + t, rx, ey + eH + t, fg);
       }
       break;
     }
@@ -502,77 +551,282 @@ void drawStatusView() {
   uint16_t fg = textOn(bg);
   tft.fillScreen(bg);
 
-  // ── Top bar (24px) — git branch · project name | wifi ──────
+  // ── Top bar (22px) — git · project | model | daemon | wifi ──
   tft.fillRect(0, 0, DISP_W, 22, C_DARKBG);
   tft.fillRect(0, 22, DISP_W, 2, C_ORANGE);
   tft.setTextColor(C_WHITE); tft.setTextSize(1);
-  tft.setCursor(6, 8);
+
+  // Left: git branch + project
+  tft.setCursor(4, 8);
   String topLine = "";
-  if (claudeStatus.git_branch.length() > 0) topLine = "git:" + claudeStatus.git_branch;
+  if (claudeStatus.git_branch.length() > 0) topLine = claudeStatus.git_branch;
   if (claudeStatus.project.length() > 0) {
     if (topLine.length()) topLine += " ";
     topLine += claudeStatus.project;
   }
   if (topLine.length() == 0) topLine = "Clawd Mochi";
-  tft.print(fit(topLine, 28));
+  tft.print(fit(topLine, 20));
 
-  // wifi icon (right side)
+  // Center-right: model badge
+  if (claudeStatus.model.length() > 0) {
+    String m = claudeStatus.model;
+    m.toUpperCase();
+    if (m.length() > 4) m = m.substring(0, 4);
+    tft.setCursor(148, 8);
+    tft.setTextColor(C_ORANGE); tft.print(fit(m, 5));
+    tft.setTextColor(C_WHITE);
+  }
+
+  // Daemon offline indicator (top-right, before wifi)
+  bool daemonOnline = (millis() - claudeStatus.last_update_ms) < DAEMON_OFFLINE_TIMEOUT_MS
+                      || claudeStatus.last_update_ms == 0;
+  if (!daemonOnline) {
+    tft.setCursor(182, 8); tft.setTextColor(C_MUTED); tft.print("!");
+    tft.setTextColor(C_WHITE);
+  }
+
+  // Wifi icon (far right)
   if (WiFi.status() == WL_CONNECTED) {
     drawWifiIcon(DISP_W - 24, 5, WiFi.RSSI(), C_WHITE);
   } else {
-    tft.setCursor(DISP_W - 26, 8); tft.setTextColor(C_MUTED); tft.print("AP");
-  }
-
-  // ── Daemon offline indicator ─────────────────────────────
-  bool daemonOnline = (millis() - claudeStatus.last_update_ms) < DAEMON_OFFLINE_TIMEOUT_MS;
-  if (!daemonOnline && claudeStatus.last_update_ms > 0) {
-    tft.setTextColor(C_MUTED); tft.setTextSize(1);
-    tft.setCursor(6, DISP_H - 8); tft.print("daemon offline");
+    tft.setCursor(DISP_W - 20, 8); tft.setTextColor(C_MUTED); tft.print("AP");
   }
 
   // ── Eyes (centred around y=80) ───────────────────────────
   drawStatusEyes(80);
 
-  // ── Tool + task lines (y=140 onward) ─────────────────────
+  // ── Tool + task lines (y=130 onward) ─────────────────────
   tft.setTextColor(fg); tft.setTextSize(1);
   if (claudeStatus.tool.length() > 0) {
-    tft.setCursor(8, 140);
-    tft.print("> "); tft.print(fit(claudeStatus.tool + " " + String(claudeStatus.duration_s) + "s", 30));
+    tft.setCursor(6, 132);
+    String toolLine = ">" + fit(claudeStatus.tool, 12) + " " + String(claudeStatus.duration_s) + "s";
+    tft.print(toolLine);
   }
   if (claudeStatus.task.length() > 0) {
-    tft.setCursor(8, 158);
-    tft.print("- "); tft.print(fit(claudeStatus.task, 30));
+    tft.setCursor(6, 146);
+    tft.print("-"); tft.print(fit(claudeStatus.task, 30));
   }
 
-  // ── Bottom: token progress bar ───────────────────────────
-  // bar at y=210, height 12, padded 8 from edges
-  int16_t barX = 8, barY = 210, barW = DISP_W - 16, barH = 12;
+  // ── Session info line (y=164) ────────────────────────────
+  // Session duration + tool count (compact, one line)
+  bool hasSessionInfo = (claudeStatus.session_duration_s > 0 || claudeStatus.tool_count > 0);
+  if (hasSessionInfo) {
+    tft.setCursor(6, 164);
+    String info = "";
+    if (claudeStatus.session_duration_s > 0) {
+      uint16_t mins = claudeStatus.session_duration_s / 60;
+      uint8_t  secs = claudeStatus.session_duration_s % 60;
+      info = String(mins) + ":" + (secs < 10 ? "0" : "") + String(secs);
+    }
+    if (claudeStatus.tool_count > 0) {
+      if (info.length()) info += " ";
+      info += "#" + String(claudeStatus.tool_count);
+    }
+    tft.print(info);
+  }
+
+  // ── Bottom: token progress bar (y=195) ───────────────────
+  int16_t barX = 8, barY = 195, barW = DISP_W - 16, barH = 10;
   tft.drawRect(barX, barY, barW, barH, fg);
   if (claudeStatus.tokens_max > 0) {
     uint32_t pct = (uint32_t)claudeStatus.tokens_used * (barW - 2) / claudeStatus.tokens_max;
     if (pct > (uint32_t)(barW - 2)) pct = barW - 2;
     tft.fillRect(barX + 1, barY + 1, pct, barH - 2, fg);
   }
-  // label below
+
+  // ── Bottom labels (y=210..224) ───────────────────────────
+  // Left: token count, Right: daily stats
   tft.setTextColor(fg); tft.setTextSize(1);
-  tft.setCursor(8, barY + barH + 4);
-  String tokLabel = String(claudeStatus.tokens_used / 1000) + "k / " +
-                    String(claudeStatus.tokens_max / 1000) + "k tokens";
+
+  // Token label (left)
+  tft.setCursor(6, 210);
+  String tokLabel = String(claudeStatus.tokens_used / 1000) + "k/" +
+                    String(claudeStatus.tokens_max / 1000) + "k";
   tft.print(tokLabel);
 
-  // optional: daily stats summary on right
+  // Model short name under token (if space)
+  if (claudeStatus.model.length() > 0) {
+    tft.setCursor(6, 222);
+    tft.print(claudeStatus.model);
+  }
+
+  // Daily stats (right-aligned at y=210)
   if (dailyStats.valid) {
-    tft.setCursor(DISP_W - 60, barY + barH + 4);
-    String s = String(dailyStats.tools_called) + " tools";
-    tft.print(s);
+    String ds = String(dailyStats.tools_called) + " tools today";
+    int16_t tw = ds.length() * 6;  // textSize 1 = 6px/char
+    tft.setCursor(max(6, DISP_W - 6 - tw), 210);
+    tft.print(ds);
+  }
+
+  // Daemon offline note (right-aligned at y=222)
+  if (!daemonOnline) {
+    tft.setCursor(DISP_W - 80, 222);
+    tft.setTextColor(C_MUTED);
+    tft.print("daemon offline");
   }
 }
 
 // ═════════════════════════════════════════════════════════════
-//  STATE MACHINE — accept incoming status, manage priorities
+//  SCREENSAVER — Day/night cycle (view E)
+// ═════════════════════════════════════════════════════════════
+
+// Determine time-of-day phase from session_duration_s (used as boot-uptime proxy).
+// In real deployment, the daemon could push a "time_hour" field. Here we use
+// animFrame as a slowly-advancing counter so the demo is visible.
+enum DayPhase { PHASE_DAY, PHASE_EVENING, PHASE_NIGHT, PHASE_MORNING };
+
+DayPhase getDayPhase() {
+  // Cycle phases every ~20 seconds at 10fps = 200 frames per phase
+  uint32_t cycleFrames = 200;
+  uint32_t p = (animFrame / cycleFrames) % 4;
+  switch (p) {
+    case 0: return PHASE_DAY;
+    case 1: return PHASE_EVENING;
+    case 2: return PHASE_NIGHT;
+    case 3: return PHASE_MORNING;
+  }
+  return PHASE_DAY;
+}
+
+uint16_t phaseBg(DayPhase p) {
+  switch (p) {
+    case PHASE_DAY:     return tft.color565(220, 120, 40);   // warm orange
+    case PHASE_EVENING: return tft.color565(140, 60,  30);   // dusky rust
+    case PHASE_NIGHT:   return tft.color565(5,   8,   20);   // deep navy
+    case PHASE_MORNING: return tft.color565(180, 100, 60);   // soft amber
+  }
+  return C_ORANGE;
+}
+
+// Night phase has a "moon" that drifts
+void drawMoon() {
+  int16_t mx = 60 + 30 * cos(animFrame * 0.05);
+  int16_t my = 40 + 15 * sin(animFrame * 0.03);
+  tft.fillCircle(mx, my, 10, tft.color565(200, 200, 180));
+  tft.fillCircle(mx - 4, my - 3, 2, tft.color565(220, 220, 200)); // highlight
+}
+
+void drawScreenSaverView() {
+  DayPhase phase = getDayPhase();
+  uint16_t bg = phaseBg(phase);
+  uint16_t fg = textOn(bg);
+  tft.fillScreen(bg);
+
+  // Moon/stars for night
+  if (phase == PHASE_NIGHT) {
+    drawMoon();
+    // Twinkling stars (simple dots at fixed positions)
+    static const uint8_t stars[] = { 15,20, 45,50, 80,15, 160,25, 190,45, 215,15, 180,65, 40,80, 200,80, 100,55 };
+    uint8_t n = sizeof(stars) / 2;
+    for (uint8_t i = 0; i < n; i++) {
+      if ((animFrame + i * 7) % 30 < 25) {  // twinkle
+        tft.drawPixel(20 + stars[i*2], stars[i*2+1], fg);
+      }
+    }
+  }
+
+  // ── Eyes ────────────────────────────────────────────────
+  const int16_t eW = 22, eH = 34, gap = 28;
+  const int16_t centreY = 110;
+  const int16_t lx = (DISP_W - eW * 2 - gap) / 2;
+  const int16_t rx = lx + eW + gap;
+  const int16_t ey = centreY - eH / 2;
+
+  if (phase == PHASE_NIGHT) {
+    // Night: eyes closed (horizontal line)
+    tft.fillRect(lx, ey + eH/2 - 2, eW, 4, fg);
+    tft.fillRect(rx, ey + eH/2 - 2, eW, 4, fg);
+    // Slow "breathing" glow around eyes
+    uint8_t glow = (animFrame % 40) < 20 ? 50 : 90;
+    tft.drawRect(lx - 2, ey - 2, eW + 4, eH + 4, tft.color565(glow, glow, glow));
+    tft.drawRect(rx - 2, ey - 2, eW + 4, eH + 4, tft.color565(glow, glow, glow));
+  } else if (phase == PHASE_EVENING) {
+    // Evening: half-closed, drowsy
+    tft.fillRect(lx, ey + eH/2 - 6, eW, 12, fg);
+    tft.fillRect(rx, ey + eH/2 - 6, eW, 12, fg);
+    tft.drawFastHLine(lx + 4, ey + eH/2 - 1, eW - 8, bg);
+    tft.drawFastHLine(rx + 4, ey + eH/2 - 1, eW - 8, bg);
+  } else if (phase == PHASE_MORNING) {
+    // Morning: slowly opening — eyes start slit and grow over ~30 frames
+    uint8_t openPct = (animFrame % 40) < 30 ? ((animFrame % 40)) * 3 : 90;
+    int16_t openH = eH * openPct / 100;
+    if (openH < 6) openH = 6;
+    tft.fillRect(lx, ey + (eH - openH) / 2, eW, openH, fg);
+    tft.fillRect(rx, ey + (eH - openH) / 2, eW, openH, fg);
+  } else {
+    // Day: normal slow blink
+    bool blink = (animFrame % 40) < 3;
+    if (blink) {
+      tft.fillRect(lx, centreY - 2, eW, 4, fg);
+      tft.fillRect(rx, centreY - 2, eW, 4, fg);
+    } else {
+      tft.fillRect(lx, ey, eW, eH, fg);
+      tft.fillRect(rx, ey, eW, eH, fg);
+      // pupil
+      tft.fillCircle(lx + eW/2, ey + eH/2, 4, bg);
+      tft.fillCircle(rx + eW/2, ey + eH/2, 4, bg);
+    }
+  }
+
+  // ── Bottom label ─────────────────────────────────────────
+  tft.setTextColor(fg); tft.setTextSize(1);
+  const char* label = "";
+  switch (phase) {
+    case PHASE_DAY:     label = "daytime";    break;
+    case PHASE_EVENING: label = "evening";    break;
+    case PHASE_NIGHT:   label = "night";      break;
+    case PHASE_MORNING: label = "morning";    break;
+  }
+  uint8_t lw = strlen(label) * 6;
+  tft.setCursor((DISP_W - lw) / 2, 200);
+  tft.print(label);
+
+  // ── Hourly time chime ────────────────────────────────────
+  // Show time at top of each day cycle (mimics "hourly" display)
+  if ((animFrame % 200) < 20) {
+    tft.setTextColor(fg); tft.setTextSize(2);
+    char timeStr[6];
+    uint8_t hour = ((animFrame / 200) % 24);
+    snprintf(timeStr, sizeof timeStr, "%02d:00", hour);
+    uint8_t tw = strlen(timeStr) * 12;
+    tft.setCursor((DISP_W - tw) / 2, 40);
+    tft.print(timeStr);
+  }
+}
 // ═════════════════════════════════════════════════════════════
 
 void applyStatus(const ClaudeStatus& incoming) {
+  // Any incoming status counts as activity (wake from screensaver)
+  lastInteractionMs = millis();
+  if (currentView == VIEW_SCREENSAVER) {
+    currentView = previousView;
+  }
+
+  // ── Priority merging ──────────────────────────────────────
+  // If a high-priority transient state (ERROR/AWAITING/DONE) is
+  // currently active and the incoming state is lower priority,
+  // remember it as pending but don't override the higher state.
+  bool currentIsTransient = (claudeStatus.state == CS_ERROR ||
+                             claudeStatus.state == CS_AWAITING ||
+                             claudeStatus.state == CS_DONE);
+  if (currentIsTransient && incoming.state < claudeStatus.state) {
+    pendingStatus = incoming;
+    hasPendingStatus = true;
+    // still refresh non-state fields so info stays current
+    claudeStatus.tool         = incoming.tool;
+    claudeStatus.task         = incoming.task;
+    claudeStatus.tokens_used  = incoming.tokens_used;
+    claudeStatus.tokens_max   = incoming.tokens_max;
+    claudeStatus.git_branch   = incoming.git_branch;
+    claudeStatus.project      = incoming.project;
+    claudeStatus.model        = incoming.model;
+    claudeStatus.session_duration_s = incoming.session_duration_s;
+    claudeStatus.tool_count   = incoming.tool_count;
+    claudeStatus.last_update_ms = millis();
+    if (currentView == VIEW_STATUS) drawStatusView();
+    return;
+  }
+
   // Track special state transitions for timeouts
   if (incoming.state == CS_ERROR && claudeStatus.state != CS_ERROR) {
     errorStartMs = millis();
@@ -583,6 +837,7 @@ void applyStatus(const ClaudeStatus& incoming) {
 
   claudeStatus = incoming;
   claudeStatus.last_update_ms = millis();
+  hasPendingStatus = false;
 
   // Auto-switch to Status view on important events
   if (autoSwitchEnabled && currentView != VIEW_STATUS) {
@@ -597,23 +852,36 @@ void applyStatus(const ClaudeStatus& incoming) {
   if (currentView == VIEW_STATUS) drawStatusView();
 }
 
+// Apply pending status if any (called when transient state times out)
+void applyPendingIfAny() {
+  if (!hasPendingStatus) {
+    claudeStatus.state = CS_IDLE;
+    return;
+  }
+  ClaudeStatus p = pendingStatus;
+  hasPendingStatus = false;
+  // Apply the pending status (now that the high-priority state is gone)
+  // Don't re-trigger auto-switch since the user is already in a view they chose.
+  claudeStatus = p;
+  claudeStatus.last_update_ms = millis();
+}
+
 // Called from loop() to handle timeouts and animation frames.
 void tickStateMachine() {
   uint32_t now = millis();
 
-  // ERROR timeout → revert to IDLE
+  // ERROR timeout → apply pending or revert to IDLE
   if (claudeStatus.state == CS_ERROR && now - errorStartMs > ERROR_TIMEOUT_MS) {
-    claudeStatus.state = CS_IDLE;
+    applyPendingIfAny();
     if (autoSwitchEnabled && currentView == VIEW_STATUS && previousView != VIEW_STATUS) {
       currentView = previousView;
-      // redraw original view (will be handled by view switch path)
     } else if (currentView == VIEW_STATUS) {
       drawStatusView();
     }
   }
-  // DONE timeout → revert to IDLE
+  // DONE timeout → apply pending or revert to IDLE
   if (claudeStatus.state == CS_DONE && now - doneStartMs > DONE_TIMEOUT_MS) {
-    claudeStatus.state = CS_IDLE;
+    applyPendingIfAny();
     if (autoSwitchEnabled && currentView == VIEW_STATUS && previousView != VIEW_STATUS) {
       currentView = previousView;
     } else if (currentView == VIEW_STATUS) {
@@ -629,11 +897,31 @@ void tickStateMachine() {
     if (currentView == VIEW_STATUS) drawStatusView();
   }
 
-  // Animation frame tick (10 fps) for Status view
-  if (currentView == VIEW_STATUS && now - lastAnimFrameMs > 100) {
+  // ── Expression rotation (IDLE in Status view) ─────────────
+  if (claudeStatus.state == CS_IDLE && currentView == VIEW_STATUS) {
+    if (now - lastExpressionChangeMs > EXPRESSION_INTERVAL_MS) {
+      lastExpressionChangeMs = now;
+      idleExpression = (idleExpression + 1) % 4;
+    }
+  } else {
+    idleExpression = 0;
+  }
+
+  // ── Screensaver auto-entry ────────────────────────────────
+  if (currentView != VIEW_SCREENSAVER &&
+      claudeStatus.state == CS_IDLE &&
+      now - lastInteractionMs > SCREENSAVER_TIMEOUT_MS) {
+    previousView = currentView;
+    currentView = VIEW_SCREENSAVER;
+  }
+
+  // ── Animation frame tick (10 fps) ─────────────────────────
+  if ((currentView == VIEW_STATUS || currentView == VIEW_SCREENSAVER)
+      && now - lastAnimFrameMs > 100) {
     lastAnimFrameMs = now;
     animFrame++;
-    drawStatusView();
+    if (currentView == VIEW_STATUS) drawStatusView();
+    else drawScreenSaverView();
   }
 }
 
@@ -906,6 +1194,8 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
 <div class="sec">// controls</div>
 <div class="ctrl">
   <button class="cbtn on" id="blBtn" onclick="toggleBL()">&#9728; display on</button>
+  <button class="cbtn on" id="moodBtn" onclick="toggleMood()">&#127752; mood light on</button>
+  <button class="cbtn on" id="autoBtn" onclick="toggleAuto()">&#8635; auto switch on</button>
 </div>
 
 <div class="sec">// views</div>
@@ -1097,6 +1387,24 @@ async function toggleBL() {
   b.classList.toggle('dim', !blOn);
 }
 
+// ── Mood light + auto-switch toggles ───────────────────────────
+async function toggleMood() {
+  const btn = document.getElementById('moodBtn');
+  const on = btn.classList.contains('on');
+  await fetch('/mood?on=' + (on ? 0 : 1));
+  btn.textContent = on ? '\u{1F30A} mood off' : '\u{1F308} mood on';
+  btn.classList.toggle('on', !on);
+  btn.classList.toggle('dim', on);
+}
+async function toggleAuto() {
+  const btn = document.getElementById('autoBtn');
+  const on = btn.classList.contains('on');
+  await fetch('/autosw?on=' + (on ? 0 : 1));
+  btn.textContent = on ? 'auto off' : 'auto on';
+  btn.classList.toggle('on', !on);
+  btn.classList.toggle('dim', on);
+}
+
 // ── Canvas toggle ───────────────────────────────────────────────
 async function toggleCanvas() {
   canvasOpen = !canvasOpen;
@@ -1224,6 +1532,18 @@ async function clearAll() {
       b.textContent = '\u25cb display off';
       b.classList.remove('on'); b.classList.add('dim');
     }
+    // Sync mood light toggle
+    if (j.mood === false) {
+      const m = document.getElementById('moodBtn');
+      m.textContent = '\u{1F30A} mood light off';
+      m.classList.remove('on'); m.classList.add('dim');
+    }
+    // Sync auto-switch toggle
+    if (j.autosw === false) {
+      const a = document.getElementById('autoBtn');
+      a.textContent = 'auto switch off';
+      a.classList.remove('on'); a.classList.add('dim');
+    }
   } catch(e) {}
   // Always reset bg picker to default orange on page load
   document.getElementById('bgCol').value = '#aa4818';
@@ -1249,6 +1569,9 @@ void routeCmd() {
     server.send(400, "application/json", "{\"e\":1}"); return;
   }
   const char c = server.arg("k")[0];
+  lastInteractionMs = millis();  // wake from screensaver
+  // If currently in screensaver, exit to previous view first
+  if (currentView == VIEW_SCREENSAVER) currentView = previousView;
 
   if (termMode) {
     if (c == 'q') { termMode = false; drawCodeView(); }
@@ -1266,8 +1589,9 @@ void routeCmd() {
       currentView = VIEW_EYES_NORMAL;
       animLogoReveal();
       break;
-    case 'x':   // NEW: show Status view
+    case 'x':   // show Status view
       currentView = VIEW_STATUS;
+      lastInteractionMs = millis();
       drawStatusView();
       break;
   }
@@ -1297,6 +1621,7 @@ void routeRedraw() {
     case VIEW_CODE:        drawCodeView();   break;
     case VIEW_DRAW:        tft.fillScreen(drawBgColor); break;
     case VIEW_STATUS:      drawStatusView(); break;
+    case VIEW_SCREENSAVER: drawScreenSaverView(); break;
   }
   server.send(200, "application/json", "{\"ok\":1}");
 }
@@ -1354,6 +1679,25 @@ void routeBacklight() {
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
+// GET /mood?on=1|0 — toggle mood-light background
+void routeMood() {
+  moodLightEnabled = server.hasArg("on") && server.arg("on") == "1";
+  prefs.begin("clawd", false);
+  prefs.putBool("mood", moodLightEnabled);
+  prefs.end();
+  if (currentView == VIEW_STATUS) drawStatusView();
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
+// GET /autosw?on=1|0 — toggle auto-switch to Status on important events
+void routeAutoSw() {
+  autoSwitchEnabled = server.hasArg("on") && server.arg("on") == "1";
+  prefs.begin("clawd", false);
+  prefs.putBool("autosw", autoSwitchEnabled);
+  prefs.end();
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
 // Convert RGB565 back to #RRGGBB for state endpoint
 String rgb565ToHex(uint16_t c) {
   uint8_t r = ((c >> 11) & 0x1F) << 3;
@@ -1386,6 +1730,9 @@ void routeState() {
   j += ",\"tm\":";       j += claudeStatus.tokens_max;
   j += ",\"branch\":\"";j += claudeStatus.git_branch; j += "\"";
   j += ",\"project\":\"";j += claudeStatus.project;   j += "\"";
+  j += ",\"model\":\"";  j += claudeStatus.model;    j += "\"";
+  j += ",\"sdur\":";     j += claudeStatus.session_duration_s;
+  j += ",\"tcnt\":";     j += claudeStatus.tool_count;
   j += "}}";
   server.send(200, "application/json", j);
 }
@@ -1421,6 +1768,9 @@ void routeApiStatus() {
   s.tokens_max  = doc["tokens_max"]  | 200000;
   s.git_branch  = (const char*)(doc["git_branch"] | "");
   s.project     = (const char*)(doc["project"]    | "");
+  s.model       = (const char*)(doc["model"]       | "");
+  s.session_duration_s = doc["session_duration_s"] | 0;
+  s.tool_count  = doc["tool_count"]  | 0;
   s.last_update_ms = millis();
 
   applyStatus(s);
@@ -1724,6 +2074,9 @@ void setup() {
   dailyStats.sessions     = prefs.getUShort("stats_sessions", 0);
   dailyStats.errors       = prefs.getUShort("stats_errors", 0);
   dailyStats.valid        = dailyStats.date.length() > 0;
+  // Restore mood-light / auto-switch toggles
+  moodLightEnabled  = prefs.getBool("mood",   true);
+  autoSwitchEnabled = prefs.getBool("autosw", true);
   prefs.end();
 
   // ── Start WiFi (AP + STA dual mode) ────────────────────────
@@ -1769,6 +2122,8 @@ void setup() {
   server.on("/draw/clear",  HTTP_GET,  routeDrawClear);
   server.on("/draw/stroke", HTTP_GET,  routeDrawStroke);
   server.on("/backlight",   HTTP_GET,  routeBacklight);
+  server.on("/mood",        HTTP_GET,  routeMood);
+  server.on("/autosw",      HTTP_GET,  routeAutoSw);
   server.on("/state",       HTTP_GET,  routeState);
   // ── Claude status API
   server.on("/api/status",      HTTP_POST, routeApiStatus);
@@ -1782,7 +2137,34 @@ void setup() {
   server.onNotFound(routeNotFound);
   server.begin();
 
+  // ── Captive portal (DNS resolves anything to AP IP) ───────
+  // Phones see "no internet" on the AP and auto-open 192.168.4.1
+  dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+
+  // ── OTA wireless update ───────────────────────────────────
+  // After first connection, you can re-upload via Arduino IDE
+  // by selecting the network port (clawd-mochi.local).
+  ArduinoOTA.setHostname("clawd-mochi");
+  ArduinoOTA.onStart([]() {
+    tft.fillScreen(C_DARKBG);
+    tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+    tft.setCursor(20, 100); tft.print("OTA Update...");
+  });
+  ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
+    int16_t pct = t > 0 ? (p * 100 / t) : 0;
+    tft.fillRect(20, 130, 200, 16, C_DARKBG);
+    tft.setTextColor(C_WHITE); tft.setTextSize(2);
+    tft.setCursor(20, 130); tft.print(String(pct) + "%");
+  });
+  ArduinoOTA.onError([](ota_error_t e) {
+    tft.fillScreen(MOOD_ERROR);
+    tft.setTextColor(C_WHITE); tft.setTextSize(2);
+    tft.setCursor(20, 100); tft.print("OTA Failed");
+  });
+  ArduinoOTA.begin();
+
   lastWifiScanMs = millis();
+  lastInteractionMs = millis();
   // WiFi info stays on screen — first button press triggers setView/cmd
   // which will replace it with the correct view
 }
@@ -1793,6 +2175,8 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  dnsServer.processNextRequest();  // captive portal
+  ArduinoOTA.handle();              // OTA updates
   tickStateMachine();
 
   // Periodic WiFi rescan: every 5 min, try connecting to the

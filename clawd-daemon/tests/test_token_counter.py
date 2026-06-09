@@ -37,9 +37,10 @@ def test_count_basic(tmp_path):
         },
     ]
     _write_transcript(tmp_path, sid, events)
-    used, tmax = count_tokens(tmp_path, sid, "sonnet")
+    used, tmax, model = count_tokens(tmp_path, sid, "sonnet")
     assert used == 100 + 50 + 200 + 75 + 500
     assert tmax == 200_000
+    assert model == "sonnet"
 
 
 def test_count_with_model_name(tmp_path):
@@ -53,18 +54,21 @@ def test_count_with_model_name(tmp_path):
         },
     ]
     _write_transcript(tmp_path, sid, events)
-    used, tmax = count_tokens(tmp_path, sid, "sonnet")
+    used, tmax, model = count_tokens(tmp_path, sid, "sonnet")
     assert used == 50
     assert tmax == 200_000  # comes from opus entry in DEFAULT_MODEL_LIMITS
+    assert model == "opus"
 
 
 def test_empty_session_returns_zeros(tmp_path):
-    used, tmax = count_tokens(tmp_path, "nonexistent", "haiku")
+    used, tmax, model = count_tokens(tmp_path, "nonexistent", "haiku")
     assert used == 0
     assert tmax == 200_000
+    assert model == "haiku"
 
 
 def test_no_session_id():
-    used, tmax = count_tokens(Path("."), None, "sonnet")
+    used, tmax, model = count_tokens(Path("."), None, "sonnet")
     assert used == 0
     assert tmax == 200_000
+    assert model == "sonnet"

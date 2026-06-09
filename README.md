@@ -234,3 +234,130 @@ To contribute: fork the repo, make your changes, and open a pull request. Please
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 **Note:** 3D models and media assets are licensed under **CC BY-NC-SA 4.0**.
+
+rm -f /usr/local/bin/jq && cat > /usr/local/bin/jq <<'PYEOF'
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import sys, json, re
+def try_parse_json_at(s, start):
+    if start >= len(s) or s[start] not in '{[':
+        return None
+    stack = []
+    pairs = {'}': '{', ']': '['}
+    in_str = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch in '{[':
+            stack.append(ch)
+        elif ch in '}]':
+            if stack and stack[-1] == pairs[ch]:
+                stack.pop()
+                if not stack:
+                    try:
+                        return json.loads(s[start:i+1]), i + 1
+                    except Exception:
+                        return None
+    return None
+def format_line(line):
+    out = []
+    last = 0
+    for m in re.finditer(r'=(?=[\{\[])', line):
+        if m.start() < last:
+            continue
+        json_start = m.end()
+        result = try_parse_json_at(line, json_start)
+        if result:
+            obj, end = result
+            out.append(line[last:json_start])
+            out.append('\n' + json.dumps(obj, indent=2, ensure_ascii=False) + '\n')
+            last = end
+    out.append(line[last:])
+    return ''.join(out)
+for line in sys.stdin:
+    try:
+        sys.stdout.write(format_line(line))
+    except Exception:
+        sys.stdout.write(line)
+    sys.stdout.flush()
+PYEOF
+chmod +x /usr/local/bin/jq
+
+
+//
+
+cat > /usr/local/bin/jql <<'EOF'
+#!/bin/bash
+python2 <<'PYEOF'
+# -*- coding: utf-8 -*-
+import sys, json, re
+reload(sys)
+sys.setdefaultencoding('utf-8')
+def try_parse_json_at(s, start):
+    if start >= len(s) or s[start] not in '{[':
+        return None
+    stack = []
+    pairs = {'}': '{', ']': '['}
+    in_str = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch in '{[':
+            stack.append(ch)
+        elif ch in '}]':
+            if stack and stack[-1] == pairs[ch]:
+                stack.pop()
+                if not stack:
+                    try:
+                        return json.loads(s[start:i+1]), i + 1
+                    except Exception:
+                        return None
+    return None
+def format_line(line):
+    if '请求参数=' not in line and '响应参数=' not in line:
+        return line
+    out = []
+    last = 0
+    for m in re.finditer(r'=(?=[\{\[])', line):
+        if m.start() < last:
+            continue
+        json_start = m.end()
+        result = try_parse_json_at(line, json_start)
+        if result:
+            obj, end = result
+            out.append(line[last:json_start])
+            out.append('\n' + json.dumps(obj, indent=2, ensure_ascii=False) + '\n')
+            last = end
+    out.append(line[last:])
+    return ''.join(out)
+for line in sys.stdin:
+    try:
+        sys.stdout.write(format_line(line))
+    except Exception:
+        sys.stdout.write(line)
+    sys.stdout.flush()
+PYEOF
+EOF
+chmod +x /usr/local/bin/jql

@@ -37,7 +37,10 @@ class ClaudeStatus:
     tokens_max: int = 200_000
     git_branch: str = ""
     project: str = ""
-    updated_at: float = 0.0  # time.time()
+    model: str = ""               # "sonnet" / "opus" / "haiku"
+    session_duration_s: int = 0   # total session wall-clock
+    tool_count: int = 0           # tool call count in current session
+    updated_at: float = 0.0       # time.time()
 
     def to_payload(self) -> dict:
         """Serialize to the JSON body the ESP32 /api/status endpoint expects."""
@@ -50,6 +53,9 @@ class ClaudeStatus:
             "tokens_max": self.tokens_max,
             "git_branch": self.git_branch,
             "project": self.project,
+            "model": self.model,
+            "session_duration_s": self.session_duration_s,
+            "tool_count": self.tool_count,
         }
 
 

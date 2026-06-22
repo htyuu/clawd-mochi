@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Clawd Mochi Cockpit</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div id="title">🦀 Clawd Mochi Cockpit</div>
+    <div id="status-indicator" class="status-unknown"><span id="status-text">connecting…</span></div>
+  </header>
+
+  <div id="error-banner" class="error-banner">⚠️ <span id="error-text"></span></div>
+
+  <nav id="tabs">
+    <button class="tab-btn active" data-tab="today">📊 今日驾驶舱</button>
+    <button class="tab-btn" data-tab="timeline">⏪ 时间回放</button>
+    <button class="tab-btn" data-tab="ritual">🌅 仪式</button>
+    <button class="tab-btn" data-tab="year">📖 年鉴</button>
+  </nav>
+
+  <!-- ══════ TAB: TODAY ══════ -->
+  <section id="tab-today" class="tab-content active">
+    <div class="two-col">
+      <!-- LEFT: Remote Control -->
+      <div class="panel">
+        <h3>🎮 遥控台</h3>
+        <div class="clawd-box">
+          <div class="clawd-screen state-idle" id="clawd-screen">
+            <div class="clawd-face">
+              <div class="eye eye-l" id="eye-l"></div>
+              <div class="eye eye-r" id="eye-r"></div>
+              <div class="mouth" id="mouth"></div>
+            </div>
+          </div>
+          <div style="font-size:12px;color:#94a3b8;margin-top:6px">
+            <span id="clawd-state-label">空闲</span>
+            <span id="clawd-project"></span>
+          </div>
+        </div>
+
+        <div class="emo-buttons" id="emote-btns">
+          <button class="emo-btn emo-btn-norm" data-emote="normal">😺 正常</button>
+          <button class="emo-btn emo-btn-sqsh" data-emote="squish">😆 笑眼</button>
+          <button class="emo-btn emo-btn-x"    data-emote="error">😵 错愕</button>
+          <button class="emo-btn emo-btn-tire" data-emote="tired">😴 困倦</button>
+        </div>
+
+        <div style="margin-bottom:4px;font-size:12px;color:#94a3b8;">🎨 心情灯</div>
+        <div class="emo-buttons" id="color-btns">
+          <button class="emo-btn emo-btn-norm" data-color="#ff6b35">🟠 暖橙</button>
+          <button class="emo-btn emo-btn-x"    data-color="#2563eb">🔵 深蓝</button>
+          <button class="emo-btn emo-btn-sqsh" data-color="#eab308">🟡 姜黄</button>
+          <button class="emo-btn" style="background:#10b981;color:#fff" data-color="#10b981">🟢 翠绿</button>
+          <button class="emo-btn" style="background:#ef4444;color:#fff" data-color="#ef4444">🔴 珊瑚</button>
+        </div>
+
+        <div style="margin:10px 0 4px;font-size:12px;color:#94a3b8;">🌅 情景模式</div>
+        <div class="preset-buttons" id="preset-btns"></div>
+      </div>
+
+      <!-- RIGHT: Today Data -->
+      <div class="panel">
+        <h3>📊 今日数据</h3>
+        <div class="stat-grid" id="today-stats">
+          <div class="stat-card"><div class="num" id="stat-tools">--</div><div class="lbl">工具调用</div></div>
+          <div class="stat-card">
+            <div class="num" id="stat-tokens">--</div><div class="lbl">Token</div>
+            <div class="bar"><div class="bar-fill" id="token-bar" style="width:0;background:#3b82f6"></div></div>
+          </div>
+          <div class="stat-card"><div class="num" id="stat-sessions">--</div><div class="lbl">会话数</div></div>
+          <div class="stat-card"><div class="num" id="stat-errors">--</div><div class="lbl">错误数</div></div>
+        </div>
+        <h4 style="font-size:13px;color:#94a3b8;margin-bottom:10px;">🔥 工具排行</h4>
+        <ul class="tool-list" id="tool-rank">
+          <li style="color:#64748b;font-size:13px;">暂无数据</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════ TAB: TIMELINE ══════ -->
+  <section id="tab-timeline" class="tab-content">
+    <div class="date-picker">
+      <button id="tl-prev">‹ 前一天</button>
+      <input type="date" id="tl-date" />
+      <button id="tl-next">后一天 ›</button>
+      <button id="tl-today">今天</button>
+    </div>
+    <canvas id="tl-canvas" class="timeline-canvas" height="120"></canvas>
+    <div class="tl-info" id="tl-info">
+      <div class="row"><span class="label">时间</span><span class="value" id="tl-ts">--</span></div>
+      <div class="row"><span class="label">最主要工具</span><span class="value" id="tl-tool">--</span></div>
+      <div class="row"><span class="label">调用次数</span><span class="value" id="tl-count">--</span></div>
+      <div class="row"><span class="label">错误数</span><span class="value" id="tl-err">--</span></div>
+    </div>
+  </section>
+
+  <!-- ══════ TAB: RITUAL ══════ -->
+  <section id="tab-ritual" class="tab-content">
+    <div class="ritual-buttons" id="ritual-btns">
+      <button class="ritual-btn" data-ritual="morning">☀️ 早安<span class="time" id="rit-morning"></span></button>
+      <button class="ritual-btn" data-ritual="lunch">🍱 午休<span class="time" id="rit-lunch"></span></button>
+      <button class="ritual-btn" data-ritual="night">🌙 晚安<span class="time" id="rit-night"></span></button>
+      <button class="ritual-btn" data-ritual="offwork">🚀 下班<span class="time" id="rit-offwork"></span></button>
+    </div>
+    <div class="streak-line">
+      🔥 早安:<span id="streak-morning">0</span>天 &nbsp; 晚安:<span id="streak-night">0</span>天 &nbsp; 全勤:<span id="streak-all">0</span>天
+    </div>
+    <div id="heatmap" class="heatmap"></div>
+  </section>
+
+  <!-- ══════ TAB: YEAR ══════ -->
+  <section id="tab-year" class="tab-content">
+    <div class="year-subtabs">
+      <button class="year-subtab active" data-range="week">📅 周报</button>
+      <button class="year-subtab" data-range="month">📅 月报</button>
+      <button class="year-subtab" data-range="year">📅 年报</button>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px;">
+      <div class="stat-card"><div class="num" id="yr-tools">--</div><div class="lbl">工具调用</div></div>
+      <div class="stat-card"><div class="num" id="yr-tokens">--</div><div class="lbl">Token</div></div>
+      <div class="stat-card"><div class="num" id="yr-sessions">--</div><div class="lbl">会话</div></div>
+    </div>
+    <div class="trend-chart" id="yr-chart"></div>
+    <div class="best-row" id="yr-top">暂无数据</div>
+    <div class="comment-box" id="yr-comment">🦀 Clawd 正看着你。</div>
+  </section>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

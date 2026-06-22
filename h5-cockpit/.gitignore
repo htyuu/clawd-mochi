@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.DS_Store
+cockpit.db
+cockpit.db-journal
+cockpit.db-wal
+cockpit.db-shm

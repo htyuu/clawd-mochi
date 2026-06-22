@@ -1,0 +1,221 @@
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0f172a; color: #e2e8f0; min-height: 100vh;
+  line-height: 1.5;
+}
+
+#app { max-width: 1200px; margin: 0 auto; padding: 20px 24px; }
+
+/* --- Header --- */
+#topbar {
+  display:flex; align-items:center; justify-content:space-between;
+  margin-bottom: 16px; flex-wrap:wrap; gap: 12px;
+}
+#title { font-size: 20px; font-weight: 700; letter-spacing: 0.5px; display:flex; align-items:center; gap:8px; }
+#status-indicator {
+  font-size: 12px; padding: 6px 14px; border-radius: 20px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.status-unknown { background: #475569; color: #cbd5e1; }
+.status-ok      { background: #10b981; color: #fff; }
+.status-daemon  { background: #eab308; color: #1e293b; }
+.status-down    { background: #ef4444; color: #fff; }
+
+.error-banner {
+  background: #ef4444; color: #fff; padding: 10px 14px; border-radius: 8px;
+  margin-bottom: 12px; font-size: 13px; display: none;
+}
+.error-banner.show { display: block; }
+
+/* --- Tab nav --- */
+#tabs { display:flex; gap: 2px; margin-bottom: 0; }
+.tab-btn {
+  flex:1; padding: 10px 0; border:none; border-radius: 8px 8px 0 0;
+  background: #1e293b; color: #94a3b8; font-size: 13px; cursor: pointer;
+  transition: all .15s; font-family: inherit; font-weight: 500;
+}
+.tab-btn.active { background: #334155; color: #f1f5f9; }
+.tab-btn:hover:not(.active) { background: #273449; }
+
+/* --- Tab content --- */
+.tab-content {
+  display: none;
+  background: #1e293b; border-radius: 0 0 8px 8px;
+  padding: 24px; min-height: 460px;
+}
+.tab-content.active { display: block; }
+
+/* --- Two column layout (for today tab) --- */
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.panel { background: #0f172a; border-radius: 10px; padding: 18px; }
+.panel h3 { font-size: 14px; color: #94a3b8; margin-bottom: 14px; letter-spacing: 0.5px; }
+
+/* --- Clawd pixel CSS icon (32x32 rendered at 180px) --- */
+.clawd-box { display:flex; flex-direction:column; align-items:center; margin-bottom: 18px; }
+.clawd-screen {
+  width: 180px; height: 180px; border-radius: 16px;
+  display:flex; align-items:center; justify-content:center;
+  transition: background .4s; background: #ff6b35; /* orange idle */
+  position: relative; overflow:hidden;
+}
+/* Status color classes applied by JS */
+.clawd-screen.state-idle     { background: #ff6b35; }
+.clawd-screen.state-thinking { background: #2563eb; }
+.clawd-screen.state-done     { background: #10b981; }
+.clawd-screen.state-error    { background: #ef4444; }
+.clawd-screen.state-awaiting { background: #eab308; }
+
+.clawd-face { position: relative; width: 90px; height: 60px; }
+
+/* -- Eyes -- */
+.eye {
+  position: absolute; top: 0;
+  width: 24px; height: 30px; border-radius: 4px; background: #0f172a;
+}
+.eye-l { left: 10px; }
+.eye-r { right: 10px; }
+
+/* Squint eyes */
+.eye-squish {
+  background: transparent;
+  width: 0; height: 0; border: none;
+  border-left: 14px solid transparent;
+  border-right: 14px solid transparent;
+  border-bottom: 20px solid #0f172a;
+  border-radius: 0; top: 10px;
+}
+
+/* Error (X) eyes */
+.eye-x { background: transparent; }
+.eye-x::before, .eye-x::after {
+  content: ''; position:absolute; left:10px;
+  width: 4px; height:30px; background: #0f172a; border-radius: 2px;
+}
+.eye-x::before { transform: rotate(45deg); }
+.eye-x::after  { transform: rotate(-45deg); }
+
+/* Tired (half closed) */
+.eye-tired { height: 12px; top: 18px; }
+
+/* -- Mouth -- */
+.mouth {
+  position:absolute; bottom:0; left:50%; transform: translateX(-50%);
+  width:18px; height:4px; background: #0f172a; border-radius: 2px;
+}
+.mouth-smile {
+  width: 28px; height: 8px;
+  border-radius: 0 0 14px 14px; border: none;
+  border-bottom: 4px solid #0f172a;
+  background: transparent;
+}
+
+/* --- Controls --- */
+.emo-buttons { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:16px; }
+.emo-btn {
+  padding: 8px 12px; border:none; border-radius: 7px; font-size: 12px;
+  font-family:inherit; cursor: pointer; color:#fff; transition: transform .1s;
+  font-weight: 500;
+}
+.emo-btn:active { transform: scale(.95); }
+.emo-btn-norm { background: #ff6b35; }
+.emo-btn-sqsh { background: #10b981; }
+.emo-btn-x    { background: #ef4444; }
+.emo-btn-tire { background: #64748b; }
+
+.preset-buttons { display:flex; flex-wrap:wrap; gap: 8px; margin:14px 0 4px; }
+.preset-btn {
+  background: #334155; border:1px solid #475569; color:#e2e8f0;
+  padding: 9px 14px; border-radius:7px; font-size:13px;
+  font-family:inherit; cursor: pointer;
+}
+.preset-btn:active { transform: scale(.98); }
+
+/* --- Stats grid --- */
+.stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom:16px; }
+.stat-card { background:#1e293b; border-radius:8px; padding:12px; text-align:center; }
+.stat-card .num { font-size: 26px; font-weight: 700; color:#fff; line-height: 1.2; }
+.stat-card .lbl { font-size: 11px; color: #94a3b8; margin-top:2px; }
+.stat-card .bar { height: 8px; background: #334155; border-radius:4px; margin-top:6px; overflow:hidden; }
+.stat-card .bar-fill { height: 100%; background:#3b82f6; border-radius:4px; transition: width .4s; }
+
+/* --- Tool ranking --- */
+.tool-list { list-style:none; }
+.tool-list li {
+  display:flex; align-items:center; gap: 10px;
+  margin-bottom: 6px; font-size:13px; color: #cbd5e1;
+}
+.tool-list .bar { flex:1; height: 14px; background:#1e293b; border-radius:4px; overflow:hidden; }
+.tool-list .bar-fill { height: 100%; background: #3b82f6; border-radius:4px; min-width: 6px; transition: width .4s; }
+.tool-list .cnt { color:#94a3b8; min-width:32px; text-align:right; }
+
+/* --- Timeline --- */
+.date-picker { display:flex; align-items:center; gap:8px; margin-bottom:14px; }
+.date-picker input, .date-picker button {
+  padding: 8px 12px; border-radius: 6px; border: none;
+  font-family:inherit; font-size:13px;
+}
+.date-picker input { background: #0f172a; color:#e2e8f0; width: 130px; }
+.date-picker button { background: #334155; color:#e2e8f0; cursor:pointer; }
+
+.timeline-canvas {
+  width: 100%; height: 120px; background:#0f172a; border-radius:8px; display:block;
+}
+
+.tl-info {
+  background:#0f172a; border-radius:8px; padding: 12px; margin-top:10px; font-size:13px;
+}
+.tl-info .row { display:flex; gap: 8px; margin-bottom:4px; }
+.tl-info .label { color:#94a3b8; min-width:70px; }
+
+/* --- Rituals --- */
+.ritual-buttons { display:flex; gap: 10px; margin-bottom: 20px; flex-wrap:wrap; }
+.ritual-btn {
+  flex:1; min-width: 120px; padding:16px 8px; border:none; border-radius: 10px;
+  font-size:15px; font-family:inherit; cursor: pointer; text-align:center; color:#fff;
+  background:#475569; transition: all .15s;
+}
+.ritual-btn:hover { background:#556881; }
+.ritual-btn:active { transform: scale(.96); }
+.ritual-btn.done { opacity: .6; }
+.ritual-btn .time { display:block; font-size:11px; color:#cbd5e1; margin-top:4px; }
+
+.heatmap { display:flex; flex-wrap:wrap; gap:3px; }
+.heatmap .cell { width:12px; height:12px; border-radius:2px; }
+.cell-0 { background: #1e293b; }
+.cell-1 { background: #166534; }
+.cell-2 { background: #15803d; }
+.cell-3 { background: #22c55e; }
+.cell-4 { background: #4ade80; }
+
+.streak-line { font-size:13px; color:#94a3b8; margin-bottom:12px; }
+.streak-line span { color:#4ade80; font-weight:600; }
+
+/* --- Yearbook --- */
+.year-subtabs { display:flex; gap:2px; margin-bottom: 14px; }
+.year-subtab {
+  padding: 8px 18px; border:none; border-radius:6px;
+  background: #0f172a; color:#94a3b8; font-size:13px;
+  font-family:inherit; cursor: pointer;
+}
+.year-subtab.active { background: #334155; color:#f1f5f9; }
+
+.best-row { margin: 12px 0; font-size:14px; color:#94a3b8; }
+.best-row span { color:#e2e8f0; font-weight:600; }
+
+.comment-box {
+  background:#0f172a; border-radius:8px; padding: 14px;
+  font-size: 14px; line-height:1.6; margin-top: 14px;
+  border-left:3px solid #ff6b35;
+}
+
+.trend-chart { display:flex; align-items:flex-end; gap:3px; height:110px; padding: 8px 0; }
+.trend-chart .bar { flex:1; border-radius: 3px 3px 0 0; min-height:4px; background:#2563eb; }
+
+/* --- Responsive --- */
+@media (max-width: 768px) {
+  #app { padding:16px; }
+  .two-col { grid-template-columns: 1fr; }
+  .tab-content { padding: 16px; }
+  #tabs { font-size: 12px; }
+}

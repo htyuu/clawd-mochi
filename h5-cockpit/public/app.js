@@ -2,13 +2,72 @@
 
 document.addEventListener('DOMContentLoaded', () => {
   // ─── State (module-scoped, simple) ───────────────────
-  let currentColor = '#ff6b35';
-  let tlData = { empty: true, buckets: [] };
-  let tlDate = new Date().toISOString().slice(0, 10);
-  let currentRange = 'week';
-  let hoverTs = null;
+  let currentColor   = '#ff6b35';
+  let currentEmote   = 'normal';
+  let liveState      = 'idle';     // last state from daemon
+  let manualOverride = false;       // true while replay/ritual is overriding live sync
+  let tlData         = { empty: true, buckets: [] };
+  let tlDate         = new Date().toISOString().slice(0, 10);
+  let currentRange   = 'week';
+  let hoverTs        = null;
 
-  const $ = id => document.getElementById(id);
+  const $   = id => document.getElementById(id);
+  const warn = (where, e) => console.warn('[' + where + ']', e && (e.message || e));
+
+  // ─── State → visuals map ─────────────────────────────
+  const STATE_COLORS = {
+    idle:     '#ff6b35',
+    thinking: '#2563eb',
+    done:     '#10b981',
+    awaiting: '#eab308',
+    error:    '#ef4444',
+    unknown:  '#64748b',
+  };
+  const STATE_EMOTES = {
+    idle:     'normal',
+    thinking: 'normal',
+    done:     'squish',
+    awaiting: 'normal',
+    error:    'error',
+    unknown:  'tired',
+  };
+  const STATE_LABELS = {
+    idle:     '空闲',
+    thinking: '思考中',
+    done:     '完成',
+    awaiting: '等待中',
+    error:    '错误',
+    unknown:  '未知',
+  };
+
+  // ─── Clawd face renderer ─────────────────────────────
+  function setClawdFace(emote) {
+    currentEmote = emote;
+    const l = $('eye-l'), r = $('eye-r'), m = $('mouth');
+    l.className = 'eye eye-l';
+    r.className = 'eye eye-r';
+    m.className = 'mouth';
+    switch (emote) {
+      case 'normal': break;
+      case 'squish': l.classList.add('eye-squish'); r.classList.add('eye-squish'); m.classList.add('mouth-smile'); break;
+      case 'error':  l.classList.add('eye-x');      r.classList.add('eye-x'); break;
+      case 'tired':  l.classList.add('eye-tired');  r.classList.add('eye-tired'); break;
+    }
+  }
+
+  function setClawdColor(color) {
+    currentColor = color;
+    $('clawd-screen').className = 'clawd-screen';
+    $('clawd-screen').style.background = color;
+  }
+
+  function applyLiveState(state) {
+    if (manualOverride) return;
+    liveState = state;
+    setClawdColor(STATE_COLORS[state] || STATE_COLORS.idle);
+    setClawdFace(STATE_EMOTES[state] || 'normal');
+    $('clawd-state-label').textContent = STATE_LABELS[state] || state;
+  }
 
   // ─── Tab switching ───────────────────────────────────
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -18,7 +77,6 @@ document.addEventListener('DOMContentLoaded', () => {
       btn.classList.add('active');
       $('tab-' + btn.dataset.tab).classList.add('active');
 
-      // Refresh data on tab activation
       const tab = btn.dataset.tab;
       if (tab === 'today')    loadToday();
       if (tab === 'year')     loadYear(currentRange);
@@ -40,27 +98,31 @@ document.addEventListener('DOMContentLoaded', () => {
         indicator.className = 'status-down';
         text.textContent = 'daemon ❌';
         banner.classList.add('show');
-        $('error-text').textContent = 'daemon 未连接，遥控暂时无法工作';
-        document.querySelectorAll('.emo-btn, .preset-btn').forEach(b => { b.disabled = true; b.style.opacity = '.5'; });
+        $('error-text').textContent = 'daemon 未连接，遥控暂时无法工作（颜色按钮仍可用于本地预览）';
+        // Disable only daemon-dependent buttons (emotes/presets/rituals).
+        // Color buttons stay enabled — they preview locally.
+        document.querySelectorAll('.emo-btn[data-emote], .preset-btn, .ritual-btn')
+          .forEach(b => { b.disabled = true; b.style.opacity = '.5'; });
         return;
       }
 
       indicator.className = 'status-ok';
       text.textContent = 'daemon ✅';
       banner.classList.remove('show');
-      document.querySelectorAll('.emo-btn, .preset-btn').forEach(b => { b.disabled = false; b.style.opacity = ''; });
+      document.querySelectorAll('.emo-btn[data-emote], .preset-btn, .ritual-btn')
+        .forEach(b => { b.disabled = false; b.style.opacity = ''; });
 
-      // Reflect activity in virtual Clawd
-      const recentlyActive = s.last_ts && (Date.now() / 1000 - s.last_ts) < 60;
-      if (recentlyActive) {
-        $('clawd-state-label').textContent = '思考中';
-        $('clawd-screen').className = 'clawd-screen state-thinking';
+      // Sync virtual Clawd to inferred daemon state
+      applyLiveState(s.state || 'idle');
+
+      // Show last tool + session info in subtitle
+      if (s.last_tool) {
+        $('clawd-project').textContent = ' · ' + s.last_tool;
       } else {
-        $('clawd-state-label').textContent = '空闲';
-        $('clawd-screen').className = 'clawd-screen';
-        $('clawd-screen').style.background = currentColor;
+        $('clawd-project').textContent = '';
       }
-    } catch {
+    } catch (e) {
+      warn('pollStatus', e);
       $('status-indicator').className = 'status-down';
       $('status-text').textContent = 'daemon ❌';
     }
@@ -68,6 +130,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ─── Today tab data ──────────────────────────────────
   async function loadToday() {
+    setLoading('tool-rank', '加载中…');
     try {
       const res = await fetch('/api/today');
       const d = await res.json();
@@ -99,23 +162,18 @@ document.addEventListener('DOMContentLoaded', () => {
             <span class="cnt">${t.count}</span>
           </li>`).join('');
       }
-    } catch { /* silent */ }
-  }
-
-  // ─── Emote buttons ───────────────────────────────────
-  function setClawdFace(emote) {
-    const l = $('eye-l'), r = $('eye-r'), m = $('mouth');
-    l.className = 'eye eye-l';
-    r.className = 'eye eye-r';
-    m.className = 'mouth';
-    switch (emote) {
-      case 'normal': break; // default
-      case 'squish': l.classList.add('eye-squish'); r.classList.add('eye-squish'); m.classList.add('mouth-smile'); break;
-      case 'error':  l.classList.add('eye-x');      r.classList.add('eye-x'); break;
-      case 'tired':  l.classList.add('eye-tired');  r.classList.add('eye-tired'); break;
+    } catch (e) {
+      warn('loadToday', e);
+      $('tool-rank').innerHTML = '<li style="color:#ef4444;font-size:13px;">加载失败</li>';
     }
   }
 
+  function setLoading(id, text) {
+    const el = $(id);
+    if (el && !el.innerHTML) el.innerHTML = '<li style="color:#94a3b8;font-size:13px;">' + text + '</li>';
+  }
+
+  // ─── Emote buttons ───────────────────────────────────
   document.querySelectorAll('#emote-btns .emo-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const emote = btn.dataset.emote;
@@ -125,17 +183,13 @@ document.addEventListener('DOMContentLoaded', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ state, tool: 'emote:' + emote }),
-      });
+      }).catch(e => warn('control:emote', e));
     });
   });
 
   // ─── Color buttons ───────────────────────────────────
   document.querySelectorAll('#color-btns .emo-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      currentColor = btn.dataset.color;
-      $('clawd-screen').className = 'clawd-screen';
-      $('clawd-screen').style.background = currentColor;
-    });
+    btn.addEventListener('click', () => setClawdColor(btn.dataset.color));
   });
 
   // ─── Presets ─────────────────────────────────────────
@@ -148,19 +202,18 @@ document.addEventListener('DOMContentLoaded', () => {
       ).join('');
       document.querySelectorAll('#preset-btns .preset-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-          currentColor = btn.dataset.color;
-          $('clawd-screen').className = 'clawd-screen';
-          $('clawd-screen').style.background = currentColor;
-          const stateMap = { error: 'error', awaiting: 'awaiting', done: 'done' };
-          const ctlState = stateMap[btn.dataset.state] || btn.dataset.state || 'idle';
+          setClawdColor(btn.dataset.color);
+          const ctlState = btn.dataset.state || 'idle';
           fetch('/api/control', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ state: ctlState, tool: 'preset:' + btn.textContent }),
-          });
+          }).catch(e => warn('control:preset', e));
         });
       });
-    } catch { /* silent */ }
+    } catch (e) {
+      warn('loadPresets', e);
+    }
   }
 
   // ─── Rituals ─────────────────────────────────────────
@@ -193,32 +246,58 @@ document.addEventListener('DOMContentLoaded', () => {
         cells.push(`<div class="cell cell-${cnt}" title="${ds}: ${cnt} 仪式 (${r.map(x => x.type).join(', ')})"></div>`);
       }
       $('heatmap').innerHTML = cells.join('');
-    } catch { /* silent */ }
+    } catch (e) {
+      warn('loadRituals', e);
+    }
+  }
+
+  /** Run a multi-step ritual sequence on the virtual Clawd + forward to daemon. */
+  function runRitualSequence(type, cfg) {
+    if (!cfg) return;
+    manualOverride = true;
+
+    // Apply preset
+    setClawdColor(cfg.color);
+    setClawdFace(cfg.emote);
+
+    // Push state to daemon
+    fetch('/api/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state: cfg.state || 'idle', tool: 'ritual:' + type }),
+    }).catch(e => warn('control:ritual', e));
+
+    // Flash effect (morning/offwork)
+    if (cfg.flash) {
+      let n = 0;
+      const flashColor = '#fef3c7';
+      const baseColor  = cfg.color;
+      const id = setInterval(() => {
+        $('clawd-screen').style.background = (n % 2 === 0) ? flashColor : baseColor;
+        n++;
+        if (n >= 6) { clearInterval(id); $('clawd-screen').style.background = baseColor; }
+      }, 200);
+    }
+
+    // Release override after 5s so live polling resumes
+    setTimeout(() => { manualOverride = false; }, 5000);
   }
 
   document.querySelectorAll('.ritual-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
       const type = btn.dataset.ritual;
       try {
-        await fetch('/api/rituals', {
+        const res = await fetch('/api/rituals', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ type }),
         });
-        // Push to daemon
-        const stateMap = { morning: 'idle', lunch: 'idle', night: 'idle', offwork: 'done' };
-        fetch('/api/control', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ state: stateMap[type] || 'idle', tool: 'ritual:' + type }),
-        });
+        const d = await res.json();
+        runRitualSequence(type, d.config);
         loadRituals();
-        // Flash effect on Clawd screen
-        const scr = $('clawd-screen');
-        const orig = scr.style.background;
-        scr.style.background = '#eab308';
-        setTimeout(() => { scr.style.background = orig || currentColor; }, 300);
-      } catch { /* silent */ }
+      } catch (e) {
+        warn('ritual:click', e);
+      }
     });
   });
 
@@ -238,7 +317,16 @@ document.addEventListener('DOMContentLoaded', () => {
       hoverTs = null;
       resizeCanvas();
       drawTimeline();
-    } catch { /* silent */ }
+    } catch (e) {
+      warn('loadTimeline', e);
+    }
+  }
+
+  function bucketColor(b) {
+    // Color by dominant state: error red / busy blue / idle orange (sparse)
+    if (b.errors > 0) return '#ef4444';
+    if (b.count >= 5) return '#2563eb';
+    return '#ff6b35';
   }
 
   function drawTimeline() {
@@ -257,7 +345,7 @@ document.addEventListener('DOMContentLoaded', () => {
     buckets.forEach((b, i) => {
       const x = 20 + i * (barW + 2);
       const barH = (b.count / max) * (h - 30);
-      ctx.fillStyle = b.errors > 0 ? '#ef4444' : '#2563eb';
+      ctx.fillStyle = bucketColor(b);
       ctx.fillRect(x, h - 15 - barH, barW, barH);
       if (hoverTs === b.ts) {
         ctx.strokeStyle = '#fff';
@@ -285,12 +373,38 @@ document.addEventListener('DOMContentLoaded', () => {
         $('tl-tool').textContent = b.top_tool || '--';
         $('tl-count').textContent = b.count;
         $('tl-err').textContent = b.errors;
+        // Enable replay button now that we have a target bucket selected
+        $('tl-replay').disabled = false;
+        $('tl-replay').dataset.state = b.state || (b.errors > 0 ? 'error' : 'thinking');
         return;
       }
     }
   });
 
   tlCanvas.addEventListener('mouseleave', () => { hoverTs = null; drawTimeline(); });
+
+  // Replay button: forward selected bucket's state to daemon for ~5s
+  $('tl-replay').addEventListener('click', async () => {
+    const state = $('tl-replay').dataset.state;
+    if (!state) return;
+    manualOverride = true;
+    $('tl-replay').disabled = true;
+    $('tl-replay').textContent = '重现中…(5s)';
+    setClawdColor(STATE_COLORS[state] || STATE_COLORS.idle);
+    setClawdFace(STATE_EMOTES[state] || 'normal');
+    try {
+      await fetch('/api/replay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state }),
+      });
+    } catch (e) { warn('replay', e); }
+    setTimeout(() => {
+      manualOverride = false;
+      $('tl-replay').disabled = false;
+      $('tl-replay').textContent = '⏪ 重现此刻';
+    }, 5000);
+  });
 
   const tlInput = $('tl-date');
   tlInput.value = tlDate;
@@ -326,7 +440,6 @@ document.addEventListener('DOMContentLoaded', () => {
         ? Math.round(sum.tokens_total / 1000) + 'k' : sum.tokens_total;
       $('yr-sessions').textContent = sum.sessions;
 
-      // Trend chart
       const trend = d.trend || [];
       const maxVal = Math.max(...trend.map(t => t.tools), 1);
       $('yr-chart').innerHTML = trend.map(t =>
@@ -341,18 +454,69 @@ document.addEventListener('DOMContentLoaded', () => {
         : '暂无数据';
 
       $('yr-comment').textContent = '🦀 ' + comment(currentRange, sum);
-    } catch { /* silent */ }
+    } catch (e) {
+      warn('loadYear', e);
+    }
   }
+
+  // ── Comment pools: 4 categories × 5 templates = 20 lines, pick by sum hash ──
+  const COMMENT_POOLS = {
+    overworked: [
+      '这%P%累了。共 %C% 次调用，Clawd 心疼。',
+      '这%P% Clawd 看你按键盘按到飞起。',
+      '%C% 次调用…你的手腕还好吗？',
+      '这%P%燃烧得很认真。Clawd 端水来了。',
+      '高强度输出。Clawd 给你别上一朵小红花。',
+    ],
+    chill: [
+      '清闲的%P%。Clawd 也在摸鱼。',
+      '这%P%安静得连螃蟹都打了个哈欠。',
+      '低负载状态。Clawd 偷偷睡了。',
+      '这%P%好像很佛系。也挺好。',
+      'Clawd 闲到开始数自己腿了。',
+    ],
+    error_prone: [
+      '这%P%错误率有点高。Clawd 担心。',
+      '红色警报闪了好几次。要不歇会儿？',
+      'Bug 比想象中顽固，Clawd 给你打气。',
+      '错误也是进度的一部分。Clawd 这么觉得。',
+      '失败 ≥5%。但你还在跑。Clawd 看见了。',
+    ],
+    token_burner: [
+      'Token 烧得猛。该重启会话了。',
+      '上下文已经塞得快撑爆。Clawd 提醒一下。',
+      '消耗惊人。建议给 Claude 倒杯水。',
+      '%T%k token …深度对话型选手。',
+      'Token 用量逼近上限。压缩一下吧？',
+    ],
+    steady: [
+      '稳稳的%P%。Clawd 满意。',
+      '节奏感不错。继续保持。',
+      '正常发挥。Clawd 给个 OK 手势。',
+      '这%P%很 chill。',
+      '平稳的输出曲线。Clawd 看得很舒服。',
+    ],
+  };
 
   function comment(range, sum) {
     const period = range === 'week' ? '周' : range === 'month' ? '月' : '年';
     const calls = sum.tools_called || 0;
-    const errs = sum.errors || 0;
-    if (calls > 500) return `这${period}累了。共 ${calls} 次调用，Clawd 心疼。`;
-    if (calls < 10) return `清闲的${period}。Clawd 也在摸鱼。`;
-    if (calls && errs / calls > 0.05) return `这${period}错误率有点高。Clawd 担心。`;
-    if (sum.tokens_total > 150000) return `Token 烧得猛。该重启会话了。`;
-    return `稳稳的${period}。Clawd 满意。`;
+    const errs  = sum.errors || 0;
+    const toks  = sum.tokens_total || 0;
+
+    let pool;
+    if (calls > 500) pool = COMMENT_POOLS.overworked;
+    else if (calls < 10) pool = COMMENT_POOLS.chill;
+    else if (calls && errs / calls > 0.05) pool = COMMENT_POOLS.error_prone;
+    else if (toks > 150000) pool = COMMENT_POOLS.token_burner;
+    else pool = COMMENT_POOLS.steady;
+
+    // Stable pick based on the period's numbers (so same week always picks same line)
+    const idx = (calls + errs + Math.floor(toks / 1000)) % pool.length;
+    return pool[idx]
+      .replace('%P%', period)
+      .replace('%C%', calls)
+      .replace('%T%', Math.round(toks / 1000));
   }
 
   document.querySelectorAll('.year-subtab').forEach(btn => {

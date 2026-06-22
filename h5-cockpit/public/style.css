@@ -212,6 +212,13 @@ body {
 .trend-chart { display:flex; align-items:flex-end; gap:3px; height:110px; padding: 8px 0; }
 .trend-chart .bar { flex:1; border-radius: 3px 3px 0 0; min-height:4px; background:#2563eb; }
 
+/* --- Replay button --- */
+#tl-replay:disabled { opacity: .4; cursor: not-allowed; background: #475569; }
+
+/* --- Loading text --- */
+.loading { color: #64748b; font-size: 13px; animation: pulse 1.2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
 /* --- Responsive --- */
 @media (max-width: 768px) {
   #app { padding:16px; }

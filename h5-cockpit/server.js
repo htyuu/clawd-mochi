@@ -151,6 +151,22 @@ app.get('/api/year', (req, res) => {
   });
 });
 
+/**
+ * Infer Clawd state from the most recent tool_event.
+ *  - Last event failed within 15s   → error
+ *  - Last event within 5s           → thinking (active)
+ *  - Last event within 30s          → done (just finished)
+ *  - Otherwise                       → idle
+ */
+function inferState(lastRow) {
+  if (!lastRow) return 'idle';
+  const ageSec = Date.now() / 1000 - lastRow.ts;
+  if (lastRow.success === 0 && ageSec < 15) return 'error';
+  if (ageSec < 5)  return 'thinking';
+  if (ageSec < 30) return 'done';
+  return 'idle';
+}
+
 app.get('/api/status', async (req, res) => {
   const health = await daemonFetch('/health');
 
@@ -166,14 +182,54 @@ app.get('/api/status', async (req, res) => {
     "SELECT tools_called, tokens_total FROM daily_stats WHERE date = date('now','localtime')"
   );
 
+  const last = lastRows && lastRows[0] ? lastRows[0] : null;
+  const state = inferState(last);
+
   res.json({
     daemon: true,
     esp32: true,
-    last_tool: lastRows && lastRows[0] ? lastRows[0].tool : null,
-    last_ts:   lastRows && lastRows[0] ? lastRows[0].ts : null,
+    state,
+    last_tool: last ? last.tool : null,
+    last_ts:   last ? last.ts : null,
+    last_session: last ? last.session : null,
     today_tools:  stats && stats[0] ? stats[0].tools_called : 0,
     today_tokens: stats && stats[0] ? stats[0].tokens_total : 0,
   });
+});
+
+/**
+ * Replay a historical Clawd state for ~5s, then daemon returns to live.
+ * Body: { state: 'thinking'|'done'|'error'|'idle', duration_ms?: 5000 }
+ * Cockpit forwards the requested state to daemon; after duration_ms the
+ * daemon picks back up the real-time signal on its own (no clear-state API
+ * to call, but the next hook event overrides it).
+ */
+app.post('/api/replay', (req, res) => {
+  const { state } = req.body || {};
+  if (!state) return res.status(400).json({ error: 'state required' });
+
+  const endpoint = state === 'done' ? '/event/stop' : '/event/pre_tool';
+  const payload = state === 'done'
+    ? '{}'
+    : JSON.stringify({ tool: 'replay:' + state, cwd: process.cwd() });
+
+  const url = new URL(DAEMON_URL + endpoint);
+  const postReq = http.request({
+    hostname: url.hostname,
+    port:     url.port,
+    path:     url.pathname,
+    method:   'POST',
+    headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    timeout:  1000,
+  }, response => {
+    let data = '';
+    response.on('data', c => data += c);
+    response.on('end', () => res.json({ ok: true, daemon_response: data }));
+  });
+  postReq.on('error',   () => res.json({ ok: false, error: 'daemon unreachable' }));
+  postReq.on('timeout', () => { postReq.destroy(); res.json({ ok: false, error: 'daemon timeout' }); });
+  postReq.write(payload);
+  postReq.end();
 });
 
 app.post('/api/control', (req, res) => {
@@ -252,11 +308,15 @@ app.get('/api/timeline', (req, res) => {
       for (const t of b.tools) counts[t] = (counts[t] || 0) + 1;
       topTool = Object.keys(counts).reduce((a, x) => counts[x] > counts[a] ? x : a);
     }
+    // Dominant state: error if any failure in bucket, else "thinking" (busy bucket = blue),
+    // matches the design doc's mapping (空闲橙 / 工具调用蓝 / 错误红).
+    const state = b.errors > 0 ? 'error' : 'thinking';
     return {
       ts:       b.ts,
       count:    b.count,
       errors:   b.errors,
       top_tool: topTool,
+      state,
     };
   });
 
@@ -289,7 +349,14 @@ app.post('/api/rituals', (req, res) => {
     return res.status(400).json({ error: 'invalid ritual type' });
 
   cockpitDb.prepare('INSERT INTO ritual_logs (type) VALUES (?)').run(type);
-  res.json({ ok: true, type });
+  const configs = {
+    morning:  { state: 'idle',  color: '#ff6b35', emote: 'normal', flash: true },
+    lunch:    { state: 'idle',  color: '#eab308', emote: 'tired',  flash: false },
+    night:    { state: 'idle',  color: '#1e293b', emote: 'tired',  flash: false },
+    offwork:  { state: 'done',  color: '#10b981', emote: 'squish', flash: false },
+  };
+
+  res.json({ ok: true, type, config: configs[type] });
 });
 
 app.get('/api/rituals/streak', (req, res) => {

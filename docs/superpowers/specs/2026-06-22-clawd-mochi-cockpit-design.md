@@ -1,8 +1,14 @@
 # Clawd Mochi Cockpit 设计文档
 
 **日期**：2026-06-22
-**状态**：设计已确认，待实现
+**状态**：✅ 已实现并迭代 (2 轮)
 **作者**：yuu + Claude
+
+> **实现状态**：所有设计要点均已实现并通过验收，加入了以下补充：
+> - 通过 `tool_events` 推断 daemon 状态（daemon 未暴露 `/status` 端点）
+> - 时间轴重现功能 + 仪式序列 + 闪烁效果均已实现
+> - 评语模板池扩充到 25 条（5 类 × 5 条）
+> - 详见后文"实施变更"小节
 
 ---
 
@@ -415,7 +421,18 @@ Clawd 图标用纯 CSS（多个 `box-shadow` 拼像素螃蟹），不依赖图�
 - ✅ 点遥控按钮，实体玩偶能响应（屏幕变化）
 - ✅ 点仪式按钮，cockpit.db 写入新记录，热力图能反映
 - ✅ 跨天打开页面，今日数据自动归零，年鉴里多出新一行
-- ✅ daemon 停止后，控制功能优雅禁用，数据面板仍能看历史
+- ✅ daemon 停止后，控制功能优雅禁用（仅 emote/preset/ritual 按钮置灰，颜色按钮保持可用），数据面板仍能看历史
+
+### 9.4 实施变更（与初始设计有差异之处）
+
+| 设计 | 实现 | 原因 |
+|------|------|------|
+| `/api/status` 调 daemon `/status` 全状态 | 调 `/health` + 从 `tool_events` **推断**状态 (server.js `inferState()`) | daemon 未暴露 HTTP `/status` |
+| 时间轴桶含 `dominant_state` 字段 | 含 `state` 字段，值: `error` 或 `thinking`；前端 `bucketColor()` 额外区分密集(蓝)和稀疏(橙) | 简化，后处理更灵活 |
+| 年鉴 20+ 评论模板 | 25 条 (5 类 × 5 条)，按 (calls+errors+tokens/1000) 哈希稳定选取 | 实际实现了更多 |
+| 遥控按钮 daemon 离线时全部禁用 | 仅禁用 emote/preset/ritual 按钮，颜色按钮始终可用 | 颜色按钮纯本地操作 |
+| 重现按钮 5 秒后自动恢复当前实时状态 | 通过 `manualOverride` 标志让 2s 轮询暂时跳过同步，5s 后释放 | 避免轮询覆盖 |
+| 仪式序列由独立 HTTP 客户端在 Cockpit 侧实现 | 前端 `runRitualSequence()` 处理闪烁/表情/复位，daemon 只收一条状态指令 | daemon 不支持多步序列 |
 
 ---
 

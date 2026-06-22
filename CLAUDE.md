@@ -12,9 +12,14 @@ Clawd Mochi is a physical DIY desk companion — an ESP32-C3 driving a 1.54" 240
 clawd_mochi/clawd_mochi.ino              ← ORIGINAL firmware (DO NOT MODIFY)
 clawd_mochi_companion/clawd_mochi_companion.ino  ← COMPANION firmware (active)
 clawd-daemon/clawd_daemon/               ← Python daemon package
+h5-cockpit/                              ← Browser cockpit (Node + Express + SQLite)
+docs/superpowers/specs/                  ← Design specs (markdown)
+docs/superpowers/plans/                  ← Implementation plans (markdown)
 ```
 
 The companion firmware was **copied from the original** as a starting point, then extended. The original must remain untouched — users choose which `.ino` to flash in Arduino IDE.
+
+`h5-cockpit/` is a standalone Node project — local-only web GUI that pairs with the physical Clawd Mochi. It runs on `:3000`, reads daemon SQLite read-only, and proxies control commands to the daemon. See `h5-cockpit/README.md` for full architecture.
 
 ## Building / flashing / testing
 
@@ -48,17 +53,37 @@ clawd-daemon test-push --state thinking  # visual test against real ESP32
 | `clawd-daemon test-push --state <s>` | Send fake status (idle/thinking/awaiting/done/error) |
 | `clawd-daemon uninstall` | Remove service |
 
+### h5-cockpit (browser GUI)
+
+```bash
+cd h5-cockpit
+npm install
+npm start              # serves http://localhost:3000
+```
+
+- Runs independently of daemon (data panels still work, control is just disabled)
+- Reads `~/.local/share/clawd-daemon/clawd.db` read-only
+- Writes its own `h5-cockpit/cockpit.db` for ritual logs and presets
+- Polls `/api/status` every 2s and infers state from `tool_events`
+- All API routes in `server.js`; all frontend in `public/`
+
 ## Architecture: data flow
 
 ```
 Claude Code (PreToolUse/PostToolUse/Stop/Notification/UserPromptSubmit hooks)
   → curl POST localhost:7878/event/<type>
     → Daemon (FastAPI + StateManager)
-      → StateManager.apply()  ← priority merging
-      → Esp32Client.push_status()  ← throttled HTTP POST
-        → ESP32 /api/status
-          → applyStatus()  ← priority check on device too
-          → drawStatusView()  ← renders on TFT
+      ├─ StateManager.apply()  ← priority merging
+      ├─ Storage.record_tool() ← writes tool_events row
+      └─ Esp32Client.push_status()  ← throttled HTTP POST
+         → ESP32 /api/status
+           → applyStatus()  ← priority check on device too
+           → drawStatusView()  ← renders on TFT
+
+Cockpit (Express :3000)
+  ├─ reads tool_events / daily_stats (read-only) for today/timeline/year
+  ├─ polls daemon /health every 2s + infers state from latest tool_event
+  └─ proxies /api/control → daemon /event/pre_tool|stop → ESP32
 ```
 
 ## State machine (both sides)
@@ -108,6 +133,19 @@ Claude Code (PreToolUse/PostToolUse/Stop/Notification/UserPromptSubmit hooks)
 
 - `wifi` — `count`, `s0..s4`, `p0..p4`
 - `clawd` — `stats_date`, `stats_tools`, `stats_tokens`, `stats_sessions`, `stats_errors`, `mood`, `autosw`
+
+## Cockpit state inference (no daemon /status endpoint)
+
+The daemon does not expose its current state via HTTP, so Cockpit infers it from `tool_events` rows on every `/api/status` poll:
+
+| Condition | Inferred state |
+|-----------|----------------|
+| Last event failed AND < 15s old | `error` |
+| Last event < 5s old | `thinking` |
+| Last event < 30s old | `done` |
+| Otherwise | `idle` |
+
+This is documented in `server.js:inferState()`. If the daemon ever exposes a real `/status` endpoint, prefer that and remove the inference.
 
 ## Don't commit automatically
 

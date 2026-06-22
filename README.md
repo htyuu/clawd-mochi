@@ -141,6 +141,27 @@ You should see the web controller:
 
 ---
 
+## Cockpit — desktop dashboard (optional)
+
+For users running the [Python daemon](clawd-daemon/) (which forwards Claude Code hooks to the physical device), the **Clawd Mochi Cockpit** is a local web dashboard that pairs with it:
+
+- 🎮 **Remote control** — switch emotes, mood colors, and preset scenes from your browser
+- 📊 **Today's dashboard** — tool calls, token usage, sessions, errors, and tool ranking
+- ⏪ **Timeline replay** — 5-minute resolution heatmap of your coding day; hover any bucket to "replay" that state on the physical Clawd
+- 🌅 **Rituals** — morning/lunch/night/off-work check-ins with 90-day heatmap and streak counters
+- 📖 **Yearbook** — weekly/monthly/yearly stats with trend charts and 25 rotating Clawd comments
+
+```bash
+cd h5-cockpit
+npm install
+npm start
+# open http://localhost:3000
+```
+
+Cockpit reads the daemon's SQLite read-only, proxies control commands through it, and keeps its own database for rituals and presets. It works standalone (data tabs) when the daemon is offline. See [`h5-cockpit/README.md`](h5-cockpit/README.md) for full details.
+
+---
+
 ## 3D case
 
 The electronics case (body + back) is in the `clawd_mochi` model folder:

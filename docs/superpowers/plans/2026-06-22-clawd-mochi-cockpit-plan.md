@@ -1,5 +1,7 @@
 # Clawd Mochi Cockpit Implementation Plan
 
+> **Status: ✅ COMPLETED** (2026-06-22). All 10 tasks implemented via subagent-driven development. Post-launch refinement round delivered: state inference, timeline state colors, replay button, ritual sequences with flashing, 25-line comment pool, loading states. See `docs/superpowers/specs/2026-06-22-clawd-mochi-cockpit-design.md` § 9.4 "实施变更" for differences from initial design.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a local web dashboard (Cockpit) that controls the real Clawd Mochi hardware and visualizes daemon records (tool calls, tokens, sessions).

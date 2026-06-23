@@ -28,6 +28,7 @@
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
 #include <math.h>
+#include <time.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <WebServer.h>
@@ -35,6 +36,7 @@
 #include <ArduinoJson.h>
 #include <DNSServer.h>      // Captive portal
 #include <ArduinoOTA.h>     // OTA wireless update
+#include <ESPmDNS.h>        // advertise clawd-mochi.local (network-agnostic hostname)
 
 // ── Pins ──────────────────────────────────────────────────────
 #define TFT_CS  4
@@ -47,6 +49,16 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 // ── WiFi ──────────────────────────────────────────────────────
 const char* AP_SSID = "ClaWD-Mochi";
 const char* AP_PASS = "clawd1234";
+
+// Home / fallback networks: loaded from wifi_secrets.h (gitignored, so the
+// real SSIDs/passwords never enter git). Generate it with
+// scripts/gen_wifi_secrets.sh from WIFI_SSID_N/WIFI_PASS_N env vars, or copy
+// wifi_secrets.example.h → wifi_secrets.h and fill in by hand.
+#if __has_include("wifi_secrets.h")
+  #include "wifi_secrets.h"
+#else
+  #error "wifi_secrets.h not found. Run scripts/gen_wifi_secrets.sh, or copy wifi_secrets.example.h to wifi_secrets.h and fill in your WiFi credentials."
+#endif
 WebServer server(80);
 
 // Multi-WiFi: up to 5 saved networks, auto-select strongest
@@ -65,7 +77,7 @@ DNSServer dnsServer;
 uint16_t MOOD_IDLE, MOOD_THINKING, MOOD_AWAITING, MOOD_DONE, MOOD_ERROR;
 
 // ── Display ───────────────────────────────────────────────────
-#define DISP_W 240
+#define DISP_W 320
 #define DISP_H 240
 
 // ── Eye constants (shared by both eye views) ──────────────────
@@ -133,10 +145,12 @@ bool     autoSwitchEnabled = true;  // auto switch to Status on important events
 ClaudeStatus pendingStatus;
 bool        hasPendingStatus = false;
 
-uint32_t errorStartMs    = 0;
-uint32_t doneStartMs     = 0;
+uint32_t errorStartMs     = 0;
+uint32_t doneStartMs      = 0;
+uint32_t awaitingStartMs  = 0;
 #define  ERROR_TIMEOUT_MS 5000
 #define  DONE_TIMEOUT_MS  3000
+#define  AWAITING_TIMEOUT_MS 30000UL   // awaiting auto-reverts to idle after 30s
 #define  DAEMON_OFFLINE_TIMEOUT_MS 60000UL
 
 // Screensaver / idle
@@ -145,6 +159,21 @@ uint32_t lastInteractionMs = 0;
 uint8_t  idleExpression    = 0;   // 0=normal 1=sleepy 2=puzzled 3=happy
 uint32_t lastExpressionChangeMs = 0;
 #define EXPRESSION_INTERVAL_MS 15000UL  // 15s between expression changes
+
+// Status-view partial redraw: avoid full-screen fillScreen every frame
+// (causes flicker on 240x320). Track whether the static frame is drawn
+// and which bg color it was drawn with, so we only repaint the eye area
+// + token bar on animation ticks.
+bool     statusFrameDrawn   = false;
+uint16_t statusFrameBgColor = 0;
+
+// Eye dirty-tracking (defined at top so drawStatusView()'s auto-generated
+// prototype can reference them — Arduino hoists function prototypes but
+// not variable definitions).
+uint8_t lastEyeState   = 255;  // last drawn ClaudeState for eyes
+uint8_t lastExpr        = 255;  // last idle expression
+bool    lastBlink        = false;
+int16_t lastPupilX       = 9999; // last thinking pupil ox (forces redraw on move)
 
 // Daily stats (cached from daemon)
 struct DailyStats {
@@ -407,7 +436,7 @@ void drawCodeView() {
 // ═════════════════════════════════════════════════════════════
 
 uint16_t moodColor(ClaudeState s) {
-  if (!moodLightEnabled) return C_ORANGE;
+  // Mood light: background colour follows Claude's state.
   switch (s) {
     case CS_IDLE:     return MOOD_IDLE;
     case CS_THINKING: return MOOD_THINKING;
@@ -452,15 +481,32 @@ void drawWifiIcon(int16_t x, int16_t y, int8_t rssi, uint16_t col) {
   }
 }
 
+// Eye geometry used by both clearStatusEyeBoxes() and drawStatusEyes().
+#define STATUS_EW 28
+#define STATUS_EH 44
+#define STATUS_GAP 36
+#define STATUS_CY 80
+#define STATUS_LX ((DISP_W - STATUS_EW * 2 - STATUS_GAP) / 2)
+#define STATUS_RX (STATUS_LX + STATUS_EW + STATUS_GAP)
+#define STATUS_EY (STATUS_CY - STATUS_EH / 2)
+
+// Clear only the two eye boxes (not the full-width eye band) before
+// redrawing the eyes — avoids flicker from clearing the whole band.
+void clearStatusEyeBoxes(uint16_t bg) {
+  // +2 padding so the awaiting/bigger-eye shapes that slightly exceed the
+  // box are fully erased.
+  tft.fillRect(STATUS_LX - 2, STATUS_EY - 2, STATUS_EW + 4, STATUS_EH + 4, bg);
+  tft.fillRect(STATUS_RX - 2, STATUS_EY - 2, STATUS_EW + 4, STATUS_EH + 4, bg);
+}
+
 // Draw the state-specific eye animation.
 // `centreY` is where the eyes are vertically centred.
 void drawStatusEyes(int16_t centreY) {
-  const int16_t eW = 28, eH = 44, gap = 36;
-  const int16_t lx = (DISP_W - eW * 2 - gap) / 2;
-  const int16_t rx = lx + eW + gap;
-  const int16_t ey = centreY - eH / 2;
+  const int16_t eW = STATUS_EW, eH = STATUS_EH, gap = STATUS_GAP;
+  const int16_t lx = STATUS_LX, rx = STATUS_RX;
+  const int16_t ey = STATUS_EY;
   uint16_t bg = moodColor(claudeStatus.state);
-  uint16_t fg = textOn(bg);
+  uint16_t fg = C_BLACK;  // eyes are black on the orange background
 
   switch (claudeStatus.state) {
     case CS_IDLE: {
@@ -517,9 +563,16 @@ void drawStatusEyes(int16_t centreY) {
       break;
     }
     case CS_AWAITING: {
-      uint16_t c = (animFrame % 10) < 5 ? fg : C_WHITE;
-      tft.fillRect(lx - 2, ey - 2, eW + 4, eH + 4, c);
-      tft.fillRect(rx - 2, ey - 2, eW + 4, eH + 4, c);
+      // Patient waiting: solid black eyes with a slow blink — no white
+      // flash (user wants black eyes on the orange background).
+      bool blink = (animFrame % 90) < 6;
+      if (blink) {
+        tft.fillRect(lx, ey + eH/2 - 3, eW, 6, fg);
+        tft.fillRect(rx, ey + eH/2 - 3, eW, 6, fg);
+      } else {
+        tft.fillRect(lx, ey, eW, eH, fg);
+        tft.fillRect(rx, ey, eW, eH, fg);
+      }
       break;
     }
     case CS_DONE: {
@@ -546,8 +599,30 @@ void drawStatusEyes(int16_t centreY) {
   }
 }
 
+// Forward declarations (drawStatusView calls these, defined below)
+void drawStatusFrame(uint16_t bg);
+void drawStatusEyesArea(uint16_t bg);
+void drawStatusTextLines(uint16_t fg);
+
 void drawStatusView() {
   uint16_t bg = moodColor(claudeStatus.state);
+  // Full redraw if frame not yet drawn, or bg color changed (state changed).
+  // (Static text like tool/task is refreshed on this path; it doesn't change
+  //  between pushes, so we don't need to repaint it on every animation tick.)
+  if (!statusFrameDrawn || bg != statusFrameBgColor) {
+    statusFrameDrawn   = true;
+    statusFrameBgColor = bg;
+    drawStatusFrame(bg);
+    // Full frame redraw cleared the eye area — force eyes to repaint next.
+    lastEyeState = 255; lastExpr = 255; lastBlink = false; lastPupilX = 9999;
+  }
+  // Always repaint dynamic parts (eyes + token bar)
+  drawStatusEyesArea(bg);
+}
+
+// Full static frame: bg fill, top bar, all text, token bar outline.
+// Called once per entry into Status view, or when state changes bg color.
+void drawStatusFrame(uint16_t bg) {
   uint16_t fg = textOn(bg);
   tft.fillScreen(bg);
 
@@ -567,13 +642,10 @@ void drawStatusView() {
   if (topLine.length() == 0) topLine = "Clawd Mochi";
   tft.print(fit(topLine, 20));
 
-  // Center-right: model badge
+  // Center-right: model badge (full name, e.g. "glm-latest")
   if (claudeStatus.model.length() > 0) {
-    String m = claudeStatus.model;
-    m.toUpperCase();
-    if (m.length() > 4) m = m.substring(0, 4);
     tft.setCursor(148, 8);
-    tft.setTextColor(C_ORANGE); tft.print(fit(m, 5));
+    tft.setTextColor(C_ORANGE); tft.print(fit(claudeStatus.model, 14));
     tft.setTextColor(C_WHITE);
   }
 
@@ -592,38 +664,10 @@ void drawStatusView() {
     tft.setCursor(DISP_W - 20, 8); tft.setTextColor(C_MUTED); tft.print("AP");
   }
 
-  // ── Eyes (centred around y=80) ───────────────────────────
-  drawStatusEyes(80);
+  // ── Eyes + token bar + text lines painted by drawStatusEyesArea() ──
 
-  // ── Tool + task lines (y=130 onward) ─────────────────────
-  tft.setTextColor(fg); tft.setTextSize(1);
-  if (claudeStatus.tool.length() > 0) {
-    tft.setCursor(6, 132);
-    String toolLine = ">" + fit(claudeStatus.tool, 12) + " " + String(claudeStatus.duration_s) + "s";
-    tft.print(toolLine);
-  }
-  if (claudeStatus.task.length() > 0) {
-    tft.setCursor(6, 146);
-    tft.print("-"); tft.print(fit(claudeStatus.task, 30));
-  }
-
-  // ── Session info line (y=164) ────────────────────────────
-  // Session duration + tool count (compact, one line)
-  bool hasSessionInfo = (claudeStatus.session_duration_s > 0 || claudeStatus.tool_count > 0);
-  if (hasSessionInfo) {
-    tft.setCursor(6, 164);
-    String info = "";
-    if (claudeStatus.session_duration_s > 0) {
-      uint16_t mins = claudeStatus.session_duration_s / 60;
-      uint8_t  secs = claudeStatus.session_duration_s % 60;
-      info = String(mins) + ":" + (secs < 10 ? "0" : "") + String(secs);
-    }
-    if (claudeStatus.tool_count > 0) {
-      if (info.length()) info += " ";
-      info += "#" + String(claudeStatus.tool_count);
-    }
-    tft.print(info);
-  }
+  // ── Tool + task + session lines (y=132..172) ─────────────
+  drawStatusTextLines(fg);
 
   // ── Bottom: token progress bar (y=195) ───────────────────
   int16_t barX = 8, barY = 195, barW = DISP_W - 16, barH = 10;
@@ -666,131 +710,192 @@ void drawStatusView() {
   }
 }
 
-// ═════════════════════════════════════════════════════════════
-//  SCREENSAVER — Day/night cycle (view E)
-// ═════════════════════════════════════════════════════════════
-
-// Determine time-of-day phase from session_duration_s (used as boot-uptime proxy).
-// In real deployment, the daemon could push a "time_hour" field. Here we use
-// animFrame as a slowly-advancing counter so the demo is visible.
-enum DayPhase { PHASE_DAY, PHASE_EVENING, PHASE_NIGHT, PHASE_MORNING };
-
-DayPhase getDayPhase() {
-  // Cycle phases every ~20 seconds at 10fps = 200 frames per phase
-  uint32_t cycleFrames = 200;
-  uint32_t p = (animFrame / cycleFrames) % 4;
-  switch (p) {
-    case 0: return PHASE_DAY;
-    case 1: return PHASE_EVENING;
-    case 2: return PHASE_NIGHT;
-    case 3: return PHASE_MORNING;
+// Paint the dynamic text lines (tool + duration, task, session info).
+// Extracted so both drawStatusFrame (full) and drawStatusEyesArea (per-tick)
+// can render them — this lets duration_s / session_duration refresh every
+// tick without a full-screen fillScreen (which would flicker).
+void drawStatusTextLines(uint16_t fg) {
+  tft.setTextColor(fg); tft.setTextSize(1);
+  // Tool line (y=132): ">ToolName Ns"
+  if (claudeStatus.tool.length() > 0) {
+    tft.setCursor(6, 132);
+    String toolLine = ">" + fit(claudeStatus.tool, 12) + " " + String(claudeStatus.duration_s) + "s";
+    tft.print(toolLine);
   }
-  return PHASE_DAY;
+  // Task line (y=146)
+  if (claudeStatus.task.length() > 0) {
+    tft.setCursor(6, 146);
+    tft.print("-"); tft.print(fit(claudeStatus.task, 30));
+  }
+  // Session info line (y=164): "M:SS #count"
+  bool hasSessionInfo = (claudeStatus.session_duration_s > 0 || claudeStatus.tool_count > 0);
+  if (hasSessionInfo) {
+    tft.setCursor(6, 164);
+    String info = "";
+    if (claudeStatus.session_duration_s > 0) {
+      uint16_t mins = claudeStatus.session_duration_s / 60;
+      uint8_t  secs = claudeStatus.session_duration_s % 60;
+      info = String(mins) + ":" + (secs < 10 ? "0" : "") + String(secs);
+    }
+    if (claudeStatus.tool_count > 0) {
+      if (info.length()) info += " ";
+      info += "#" + String(claudeStatus.tool_count);
+    }
+    tft.print(info);
+  }
 }
 
-uint16_t phaseBg(DayPhase p) {
-  switch (p) {
-    case PHASE_DAY:     return tft.color565(220, 120, 40);   // warm orange
-    case PHASE_EVENING: return tft.color565(140, 60,  30);   // dusky rust
-    case PHASE_NIGHT:   return tft.color565(5,   8,   20);   // deep navy
-    case PHASE_MORNING: return tft.color565(180, 100, 60);   // soft amber
+// Dynamic repaint (called every animation tick + on every status push).
+// Only touches the eye band, text lines, and token bar — the static frame
+// (bg, top bar) is left untouched, eliminating full-screen flicker.
+//
+// Eyes are redrawn ONLY when the visible shape changes (blink toggle,
+// state/expression switch, or thinking pupil position) — clearing just the
+// eye boxes instead of the whole eye band avoids the per-tick flicker that
+// repainting the full-width band caused.
+void drawStatusEyesArea(uint16_t bg) {
+  uint16_t fg = textOn(bg);
+  // Top bar right side: live clock (HH:MM, Beijing time via NTP) + wifi.
+  // Repainted every tick so the clock updates; sits left of the wifi icon.
+  tft.fillRect(DISP_W - 82, 0, 82, 22, C_DARKBG);
+  {
+    struct tm tinfo;
+    if (getLocalTime(&tinfo, 50)) {
+      char timeStr[6];
+      snprintf(timeStr, sizeof timeStr, "%02d:%02d", tinfo.tm_hour, tinfo.tm_min);
+      tft.setTextColor(C_WHITE); tft.setTextSize(1);
+      tft.setCursor(DISP_W - 78, 8);
+      tft.print(timeStr);
+    }
   }
-  return C_ORANGE;
+  if (WiFi.status() == WL_CONNECTED) {
+    drawWifiIcon(DISP_W - 24, 5, WiFi.RSSI(), C_WHITE);
+  } else {
+    tft.setCursor(DISP_W - 20, 8); tft.setTextColor(C_MUTED); tft.print("AP");
+  }
+
+  // ── Eyes: redraw only when the visible shape changes ────────────
+  // Compute the current eye "signature" and compare to last draw.
+  uint8_t st = claudeStatus.state;
+  bool blink = false;
+  int16_t pupilX = 0;
+  bool needRedraw = false;
+
+  if (st == CS_IDLE && idleExpression == 0) {
+    blink = (animFrame % 60) < 4;
+  } else if (st == CS_AWAITING) {
+    blink = (animFrame % 90) < 6;
+  } else if (st == CS_THINKING) {
+    pupilX = 4 * cos(animFrame * 0.3);   // moving pupil → redraw every frame
+  }
+
+  if (st != lastEyeState)              needRedraw = true;
+  if (st == CS_IDLE && idleExpression != lastExpr) needRedraw = true;
+  if ((st == CS_IDLE && idleExpression == 0) || st == CS_AWAITING) {
+    if (blink != lastBlink)            needRedraw = true;
+  }
+  if (st == CS_THINKING && pupilX != lastPupilX) needRedraw = true;
+
+  if (needRedraw) {
+    // Clear ONLY the eye boxes (not the full eye band) before redrawing,
+    // so neighbouring pixels don't flash.
+    clearStatusEyeBoxes(bg);
+    drawStatusEyes(80);
+    lastEyeState = st;
+    lastExpr = idleExpression;
+    lastBlink = blink;
+    lastPupilX = pupilX;
+  }
+
+  // Text band: y 128..172 (tool/task/session lines) — cleared + repainted
+  // every tick so duration_s / session_duration update live.
+  tft.fillRect(0, 128, DISP_W, 46, bg);
+  drawStatusTextLines(fg);
+
+  // Token bar fill (outline stays from the frame; just refill the inner)
+  int16_t barX = 8, barY = 195, barW = DISP_W - 16, barH = 10;
+  tft.fillRect(barX + 1, barY + 1, barW - 2, barH - 2, bg);  // clear old fill
+  if (claudeStatus.tokens_max > 0) {
+    uint32_t pct = (uint32_t)claudeStatus.tokens_used * (barW - 2) / claudeStatus.tokens_max;
+    if (pct > (uint32_t)(barW - 2)) pct = barW - 2;
+    tft.fillRect(barX + 1, barY + 1, pct, barH - 2, fg);
+  }
 }
 
-// Night phase has a "moon" that drifts
-void drawMoon() {
-  int16_t mx = 60 + 30 * cos(animFrame * 0.05);
-  int16_t my = 40 + 15 * sin(animFrame * 0.03);
-  tft.fillCircle(mx, my, 10, tft.color565(200, 200, 180));
-  tft.fillCircle(mx - 4, my - 3, 2, tft.color565(220, 220, 200)); // highlight
+// ═════════════════════════════════════════════════════════════
+//  SCREENSAVER (view 5) — entered after 2 min idle
+//  Unified look: orange background + black eyes + orange pupils + clock.
+//  Uses partial redraw (background drawn once, only eyes/clock refresh
+//  per frame) to avoid the full-screen flicker that fillScreen() every
+//  tick would cause.
+// ═════════════════════════════════════════════════════════════
+
+bool saverBlinking = false;     // current eye state (avoids redundant redraw)
+char saverLastTime[6] = "";    // last drawn clock string (avoid redrawing same minute)
+uint8_t lastDrawnView = 255;  // view we last fully painted (force bg repaint on change)
+
+// Eye geometry (kept stable so partial redraw can clear just the eye box).
+#define SAVER_EW 22
+#define SAVER_EH 34
+#define SAVER_GAP 28
+#define SAVER_CY 110
+#define SAVER_LX ((DISP_W - SAVER_EW * 2 - SAVER_GAP) / 2)
+#define SAVER_RX (SAVER_LX + SAVER_EW + SAVER_GAP)
+#define SAVER_EY (SAVER_CY - SAVER_EH / 2)
+
+void drawSaverEyes(bool blink) {
+  uint16_t fg = C_BLACK;
+  uint16_t bg = C_ORANGE;
+  // Clear the eye region first (covers pupil when switching to blink),
+  // then draw the current state.
+  tft.fillRect(SAVER_LX - 2, SAVER_EY - 2, SAVER_EW + 4, SAVER_EH + 4, bg);
+  tft.fillRect(SAVER_RX - 2, SAVER_EY - 2, SAVER_EW + 4, SAVER_EH + 4, bg);
+  if (blink) {
+    tft.fillRect(SAVER_LX, SAVER_CY - 2, SAVER_EW, 4, fg);
+    tft.fillRect(SAVER_RX, SAVER_CY - 2, SAVER_EW, 4, fg);
+  } else {
+    tft.fillRect(SAVER_LX, SAVER_EY, SAVER_EW, SAVER_EH, fg);
+    tft.fillRect(SAVER_RX, SAVER_EY, SAVER_EW, SAVER_EH, fg);
+    tft.fillCircle(SAVER_LX + SAVER_EW / 2, SAVER_EY + SAVER_EH / 2, 4, bg);
+    tft.fillCircle(SAVER_RX + SAVER_EW / 2, SAVER_EY + SAVER_EH / 2, 4, bg);
+  }
+}
+
+void drawSaverClock(const char* timeStr) {
+  // Clear clock band then redraw (textSize 2 → 12px/char, 5 chars).
+  tft.fillRect(0, 38, DISP_W, 20, C_ORANGE);
+  tft.setTextColor(C_BLACK); tft.setTextSize(2);
+  uint8_t tw = strlen(timeStr) * 12;
+  tft.setCursor((DISP_W - tw) / 2, 40);
+  tft.print(timeStr);
 }
 
 void drawScreenSaverView() {
-  DayPhase phase = getDayPhase();
-  uint16_t bg = phaseBg(phase);
-  uint16_t fg = textOn(bg);
-  tft.fillScreen(bg);
-
-  // Moon/stars for night
-  if (phase == PHASE_NIGHT) {
-    drawMoon();
-    // Twinkling stars (simple dots at fixed positions)
-    static const uint8_t stars[] = { 15,20, 45,50, 80,15, 160,25, 190,45, 215,15, 180,65, 40,80, 200,80, 100,55 };
-    uint8_t n = sizeof(stars) / 2;
-    for (uint8_t i = 0; i < n; i++) {
-      if ((animFrame + i * 7) % 30 < 25) {  // twinkle
-        tft.drawPixel(20 + stars[i*2], stars[i*2+1], fg);
-      }
-    }
+  // Paint the full background once on entry (or when the view changed
+  // since we last drew). After that, only eyes/clock refresh per frame.
+  if (lastDrawnView != VIEW_SCREENSAVER) {
+    tft.fillScreen(C_ORANGE);
+    saverBlinking = false;
+    saverLastTime[0] = '\0';
+    lastDrawnView = VIEW_SCREENSAVER;
   }
 
-  // ── Eyes ────────────────────────────────────────────────
-  const int16_t eW = 22, eH = 34, gap = 28;
-  const int16_t centreY = 110;
-  const int16_t lx = (DISP_W - eW * 2 - gap) / 2;
-  const int16_t rx = lx + eW + gap;
-  const int16_t ey = centreY - eH / 2;
-
-  if (phase == PHASE_NIGHT) {
-    // Night: eyes closed (horizontal line)
-    tft.fillRect(lx, ey + eH/2 - 2, eW, 4, fg);
-    tft.fillRect(rx, ey + eH/2 - 2, eW, 4, fg);
-    // Slow "breathing" glow around eyes
-    uint8_t glow = (animFrame % 40) < 20 ? 50 : 90;
-    tft.drawRect(lx - 2, ey - 2, eW + 4, eH + 4, tft.color565(glow, glow, glow));
-    tft.drawRect(rx - 2, ey - 2, eW + 4, eH + 4, tft.color565(glow, glow, glow));
-  } else if (phase == PHASE_EVENING) {
-    // Evening: half-closed, drowsy
-    tft.fillRect(lx, ey + eH/2 - 6, eW, 12, fg);
-    tft.fillRect(rx, ey + eH/2 - 6, eW, 12, fg);
-    tft.drawFastHLine(lx + 4, ey + eH/2 - 1, eW - 8, bg);
-    tft.drawFastHLine(rx + 4, ey + eH/2 - 1, eW - 8, bg);
-  } else if (phase == PHASE_MORNING) {
-    // Morning: slowly opening — eyes start slit and grow over ~30 frames
-    uint8_t openPct = (animFrame % 40) < 30 ? ((animFrame % 40)) * 3 : 90;
-    int16_t openH = eH * openPct / 100;
-    if (openH < 6) openH = 6;
-    tft.fillRect(lx, ey + (eH - openH) / 2, eW, openH, fg);
-    tft.fillRect(rx, ey + (eH - openH) / 2, eW, openH, fg);
-  } else {
-    // Day: normal slow blink
-    bool blink = (animFrame % 40) < 3;
-    if (blink) {
-      tft.fillRect(lx, centreY - 2, eW, 4, fg);
-      tft.fillRect(rx, centreY - 2, eW, 4, fg);
-    } else {
-      tft.fillRect(lx, ey, eW, eH, fg);
-      tft.fillRect(rx, ey, eW, eH, fg);
-      // pupil
-      tft.fillCircle(lx + eW/2, ey + eH/2, 4, bg);
-      tft.fillCircle(rx + eW/2, ey + eH/2, 4, bg);
-    }
+  // Eyes: only redraw when the blink state actually changes.
+  bool blink = (animFrame % 60) < 3;   // ~6s blink at 10fps
+  if (blink != saverBlinking) {
+    saverBlinking = blink;
+    drawSaverEyes(blink);
   }
 
-  // ── Bottom label ─────────────────────────────────────────
-  tft.setTextColor(fg); tft.setTextSize(1);
-  const char* label = "";
-  switch (phase) {
-    case PHASE_DAY:     label = "daytime";    break;
-    case PHASE_EVENING: label = "evening";    break;
-    case PHASE_NIGHT:   label = "night";      break;
-    case PHASE_MORNING: label = "morning";    break;
-  }
-  uint8_t lw = strlen(label) * 6;
-  tft.setCursor((DISP_W - lw) / 2, 200);
-  tft.print(label);
-
-  // ── Hourly time chime ────────────────────────────────────
-  // Show time at top of each day cycle (mimics "hourly" display)
-  if ((animFrame % 200) < 20) {
-    tft.setTextColor(fg); tft.setTextSize(2);
+  // Clock: only redraw when the minute string changes.
+  struct tm t;
+  if (getLocalTime(&t, 50)) {
     char timeStr[6];
-    uint8_t hour = ((animFrame / 200) % 24);
-    snprintf(timeStr, sizeof timeStr, "%02d:00", hour);
-    uint8_t tw = strlen(timeStr) * 12;
-    tft.setCursor((DISP_W - tw) / 2, 40);
-    tft.print(timeStr);
+    snprintf(timeStr, sizeof timeStr, "%02d:%02d", t.tm_hour, t.tm_min);
+    if (strcmp(timeStr, saverLastTime) != 0) {
+      strcpy(saverLastTime, timeStr);
+      drawSaverClock(timeStr);
+    }
   }
 }
 // ═════════════════════════════════════════════════════════════
@@ -801,6 +906,19 @@ void applyStatus(const ClaudeStatus& incoming) {
   if (currentView == VIEW_SCREENSAVER) {
     currentView = previousView;
   }
+  // Only force a full frame repaint if the static text or state actually
+  // changed. Daemon pushes frequently (heartbeat + duration loop), so
+  // unconditionally forcing a full fillScreen here would re-introduce flicker.
+  bool staticChanged = (incoming.state      != claudeStatus.state      ||
+                        incoming.tool       != claudeStatus.tool       ||
+                        incoming.task       != claudeStatus.task       ||
+                        incoming.model      != claudeStatus.model      ||
+                        incoming.git_branch != claudeStatus.git_branch ||
+                        incoming.project    != claudeStatus.project    ||
+                        incoming.tool_count  != claudeStatus.tool_count  ||
+                        incoming.session_duration_s != claudeStatus.session_duration_s ||
+                        incoming.tokens_max != claudeStatus.tokens_max);
+  if (staticChanged) statusFrameDrawn = false;
 
   // ── Priority merging ──────────────────────────────────────
   // If a high-priority transient state (ERROR/AWAITING/DONE) is
@@ -833,6 +951,9 @@ void applyStatus(const ClaudeStatus& incoming) {
   }
   if (incoming.state == CS_DONE && claudeStatus.state != CS_DONE) {
     doneStartMs = millis();
+  }
+  if (incoming.state == CS_AWAITING && claudeStatus.state != CS_AWAITING) {
+    awaitingStartMs = millis();
   }
 
   claudeStatus = incoming;
@@ -888,6 +1009,16 @@ void tickStateMachine() {
       drawStatusView();
     }
   }
+  // AWAITING timeout → apply pending or revert to IDLE
+  // (awaiting had no timeout before, so it got stuck with eyes flashing forever)
+  if (claudeStatus.state == CS_AWAITING && now - awaitingStartMs > AWAITING_TIMEOUT_MS) {
+    applyPendingIfAny();
+    if (autoSwitchEnabled && currentView == VIEW_STATUS && previousView != VIEW_STATUS) {
+      currentView = previousView;
+    } else if (currentView == VIEW_STATUS) {
+      drawStatusView();
+    }
+  }
 
   // Daemon offline check
   if (claudeStatus.last_update_ms > 0 &&
@@ -913,6 +1044,8 @@ void tickStateMachine() {
       now - lastInteractionMs > SCREENSAVER_TIMEOUT_MS) {
     previousView = currentView;
     currentView = VIEW_SCREENSAVER;
+    // drawScreenSaverView() repaints the background when lastDrawnView
+    // doesn't match — no explicit reset needed here.
   }
 
   // ── Animation frame tick (10 fps) ─────────────────────────
@@ -1079,7 +1212,7 @@ void animLogoReveal() {
 // ═════════════════════════════════════════════════════════════
 const char INDEX_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
@@ -1186,77 +1319,77 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
 
 <div class="hdr">
   <span class="mascot">&#x2590;&#x259B;&#x2588;&#x2588;&#x2588;&#x259C;&#x258C;<br>&#x259C;&#x2588;&#x2588;&#x2588;&#x2588;&#x2588;&#x259B;<br>&#x2598;&#x2598;&nbsp;&#x259D;&#x259D;</span>
-  <div class="sitename">CLAWD &middot; MOCHI &middot; CONTROLLER</div>
+  <div class="sitename">CLAWD &middot; MOCHI &middot; 控制台</div>
 </div>
 
 <div class="busy" id="busy"><div class="busy-i"></div></div>
 
-<div class="sec">// controls</div>
+<div class="sec">// 控制</div>
 <div class="ctrl">
-  <button class="cbtn on" id="blBtn" onclick="toggleBL()">&#9728; display on</button>
-  <button class="cbtn on" id="moodBtn" onclick="toggleMood()">&#127752; mood light on</button>
-  <button class="cbtn on" id="autoBtn" onclick="toggleAuto()">&#8635; auto switch on</button>
+  <button class="cbtn on" id="blBtn" onclick="toggleBL()">&#9728; 屏幕开</button>
+  <button class="cbtn on" id="moodBtn" onclick="toggleMood()">&#127752; 心情灯开</button>
+  <button class="cbtn on" id="autoBtn" onclick="toggleAuto()">&#8635; 自动切换开</button>
 </div>
 
-<div class="sec">// views</div>
+<div class="sec">// 视图</div>
 <div class="vgrid">
   <button class="vbtn active" data-v="0" onclick="setView(0)">
     <span class="ic">&#9632; &#9632;</span>
-    <span class="nm">Normal eyes</span>
-    <span class="ht">wiggle + blink</span>
+    <span class="nm">普通眼睛</span>
+    <span class="ht">摇摆 + 眨眼</span>
   </button>
   <button class="vbtn" data-v="1" onclick="setView(1)">
     <span class="ic">&gt; &lt;</span>
-    <span class="nm">Squish eyes</span>
-    <span class="ht">open / close</span>
+    <span class="nm">眯眼</span>
+    <span class="ht">开 / 合</span>
   </button>
   <button class="vbtn" data-v="2" onclick="setView(2)">
     <span class="ic">{ }</span>
     <span class="nm">Claude Code</span>
-    <span class="ht">opens terminal</span>
+    <span class="ht">打开终端</span>
   </button>
   <button class="vbtn" data-v="3" onclick="toggleCanvas()">
     <span class="ic">&#11035;</span>
-    <span class="nm">Canvas</span>
-    <span class="ht">draw on display</span>
+    <span class="nm">画板</span>
+    <span class="ht">在屏幕上画画</span>
   </button>
   <button class="vbtn" data-v="4" onclick="setView(4)" style="grid-column:span 2">
     <span class="ic">&#128202;</span>
-    <span class="nm">Status</span>
-    <span class="ht">Claude work status (mood light)</span>
+    <span class="nm">状态</span>
+    <span class="ht">Claude 工作状态（心情灯）</span>
   </button>
 </div>
 
 <div style="text-align:center;margin:10px 0">
-  <a href="/wifi" style="color:#da1100;font-size:12px;text-decoration:none">&#128225; WiFi setup &amp; networks</a>
+  <a href="/wifi" style="color:#da1100;font-size:12px;text-decoration:none">&#128225; WiFi 设置与网络</a>
 </div>
 
-<div class="sec">// speed</div>
+<div class="sec">// 速度</div>
 <div class="speed-row">
-  <span class="sl">slow</span>
+  <span class="sl">慢</span>
   <input type="range" id="spd" min="1" max="3" value="1" step="1" oninput="setSpeed(this.value)">
-  <span class="sv" id="spdV">slow</span>
+  <span class="sv" id="spdV">慢</span>
 </div>
 
 <div class="ctrl">
   <div class="ci" style="flex:1;display:flex;flex-direction:column;gap:4px;align-items:stretch">
-    <span class="cl" style="font-size:10px;color:#8a8278;letter-spacing:1px;font-weight:bold;text-align:center">BACKGROUND</span>
+    <span class="cl" style="font-size:10px;color:#8a8278;letter-spacing:1px;font-weight:bold;text-align:center">背景色</span>
     <input type="color" class="cs" id="bgCol" value="#aa4818" oninput="onBgChange(this.value)">
   </div>
   <div class="ci" style="flex:1;display:flex;flex-direction:column;gap:4px;align-items:stretch">
-    <span class="cl" style="font-size:10px;color:#8a8278;letter-spacing:1px;font-weight:bold;text-align:center">PEN COLOR</span>
+    <span class="cl" style="font-size:10px;color:#8a8278;letter-spacing:1px;font-weight:bold;text-align:center">画笔颜色</span>
     <input type="color" class="cs" id="penCol" value="#000000">
   </div>
 </div>
 
-<div class="sec">// terminal</div>
+<div class="sec">// 终端</div>
 <div class="twrap" id="twrap">
   <div class="thdr">
     <span class="tttl">&#9658; clawd:~$</span>
-    <button class="tx" onclick="closeTerm()">&#x2715; exit terminal</button>
+    <button class="tx" onclick="closeTerm()">&#x2715; 退出终端</button>
   </div>
   <div class="trow">
-    <input class="tin" id="tin" type="text" placeholder="type here..."
+    <input class="tin" id="tin" type="text" placeholder="在此输入..."
            autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
     <button class="tgo" onclick="termEnter()">&#8629;</button>
   </div>
@@ -1264,10 +1397,10 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
 
 <div class="cwrap" id="cwrap">
   <div class="dacts">
-    <button class="db hi" onclick="clearAll()">&#11035; clear</button>
-    <button class="db" style="border-color:#28b878;color:#28b878" onclick="toggleCanvas()">&#10003; done</button>
+    <button class="db hi" onclick="clearAll()">&#11035; 清空</button>
+    <button class="db" style="border-color:#28b878;color:#28b878" onclick="toggleCanvas()">&#10003; 完成</button>
   </div>
-  <canvas id="cvs" width="240" height="240"></canvas>
+  <canvas id="cvs" width="320" height="240"></canvas>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -1282,7 +1415,7 @@ let drawing     = false;
 let lastX = 0, lastY = 0;
 let tt;
 
-const spdLabels = ['','slow','normal','fast'];
+const spdLabels = ['','慢','中','快'];
 
 // ── Toast ──────────────────────────────────────────────────────
 function toast(msg, ok=true) {
@@ -1312,7 +1445,7 @@ function setBusy(b) {
 // ── HTTP ────────────────────────────────────────────────────────
 async function req(path) {
   try { const r = await fetch(path); return r.ok; }
-  catch(e) { toast('no connection', false); return false; }
+  catch(e) { toast('连接失败', false); return false; }
 }
 
 async function waitNotBusy() {
@@ -1352,7 +1485,7 @@ async function setView(v) {
     activeView = 4;
     document.querySelectorAll('.vbtn').forEach(b =>
       b.classList.toggle('active', parseInt(b.dataset.v) === 4));
-    toast('status view');
+    toast('状态视图');
     return;
   }
   if (!await req('/cmd?k=' + keys[v])) return;
@@ -1367,7 +1500,7 @@ async function setView(v) {
     document.querySelectorAll('.vbtn,.lbtn').forEach(b => b.disabled = true);
     const cvb = document.getElementById('cvBtn'); if (cvb) cvb.disabled = true;
     document.getElementById('tin').focus();
-    toast('terminal open');
+    toast('终端已打开');
     return;
   }
   setBusy(true);
@@ -1382,7 +1515,7 @@ async function toggleBL() {
   blOn = !blOn;
   await req('/backlight?on=' + (blOn ? 1 : 0));
   const b = document.getElementById('blBtn');
-  b.textContent = blOn ? '\u2600 display on' : '\u25cb display off';
+  b.textContent = blOn ? '\u2600 \u5c4f\u5e55\u5f00' : '\u25cb \u5c4f\u5e55\u5173';
   b.classList.toggle('on', blOn);
   b.classList.toggle('dim', !blOn);
 }
@@ -1392,7 +1525,7 @@ async function toggleMood() {
   const btn = document.getElementById('moodBtn');
   const on = btn.classList.contains('on');
   await fetch('/mood?on=' + (on ? 0 : 1));
-  btn.textContent = on ? '\u{1F30A} mood off' : '\u{1F308} mood on';
+  btn.textContent = on ? '\u{1F30A} 心情灯关' : '\u{1F308} 心情灯开';
   btn.classList.toggle('on', !on);
   btn.classList.toggle('dim', on);
 }
@@ -1400,7 +1533,7 @@ async function toggleAuto() {
   const btn = document.getElementById('autoBtn');
   const on = btn.classList.contains('on');
   await fetch('/autosw?on=' + (on ? 0 : 1));
-  btn.textContent = on ? 'auto off' : 'auto on';
+  btn.textContent = on ? '自动切换关' : '自动切换开';
   btn.classList.toggle('on', !on);
   btn.classList.toggle('dim', on);
 }
@@ -1410,7 +1543,7 @@ async function toggleCanvas() {
   canvasOpen = !canvasOpen;
   document.getElementById('cwrap').classList.toggle('open', canvasOpen);
   const b = document.getElementById('cvBtn');
-  if (b) { b.classList.toggle('on', canvasOpen); b.textContent = canvasOpen ? '\u2b1b canvas on' : '\u2b1b canvas'; }
+  if (b) { b.classList.toggle('on', canvasOpen); b.textContent = canvasOpen ? '\u2b1b \u753b\u677f\u5f00' : '\u2b1b \u753b\u677f'; }
   // highlight the canvas vbtn (data-v=3) in the grid
   document.querySelectorAll('.vbtn').forEach(btn =>
     btn.classList.toggle('active', canvasOpen && parseInt(btn.dataset.v) === 3));
@@ -1421,10 +1554,10 @@ async function toggleCanvas() {
     await req('/draw/clear?bg=' + encodeURIComponent(bg));
     // lock all other buttons
     document.querySelectorAll('.vbtn,.lbtn').forEach(b => b.disabled = true);
-    toast('canvas active');
+    toast('画板已激活');
   } else {
     setBusy(false);   // re-evaluate locks
-    toast('canvas off');
+    toast('画板已关闭');
   }
 }
 
@@ -1452,7 +1585,7 @@ async function closeTerm() {
   termOpen = false;
   document.getElementById('twrap').classList.remove('open');
   setBusy(false);
-  toast('terminal closed');
+  toast('终端已关闭');
 }
 
 // ── Canvas drawing — send full stroke on finger lift ────────────
@@ -1513,7 +1646,7 @@ async function clearAll() {
   const bg = document.getElementById('bgCol').value;
   redrawCanvas(bg);
   await req('/draw/clear?bg=' + encodeURIComponent(bg));
-  toast('cleared');
+  toast('已清空');
 }
 
 // Init: sync speed and backlight from ESP32, reset bg to default
@@ -1529,19 +1662,19 @@ async function clearAll() {
     if (j.bl === false) {
       blOn = false;
       const b = document.getElementById('blBtn');
-      b.textContent = '\u25cb display off';
+      b.textContent = '\u25cb \u5c4f\u5e55\u5173';
       b.classList.remove('on'); b.classList.add('dim');
     }
     // Sync mood light toggle
     if (j.mood === false) {
       const m = document.getElementById('moodBtn');
-      m.textContent = '\u{1F30A} mood light off';
+      m.textContent = '\u{1F30A} 心情灯关';
       m.classList.remove('on'); m.classList.add('dim');
     }
     // Sync auto-switch toggle
     if (j.autosw === false) {
       const a = document.getElementById('autoBtn');
-      a.textContent = 'auto switch off';
+      a.textContent = '自动切换关';
       a.classList.remove('on'); a.classList.add('dim');
     }
   } catch(e) {}
@@ -1592,6 +1725,7 @@ void routeCmd() {
     case 'x':   // show Status view
       currentView = VIEW_STATUS;
       lastInteractionMs = millis();
+      statusFrameDrawn = false;  // force full repaint on (re)entry
       drawStatusView();
       break;
   }
@@ -1991,34 +2125,34 @@ a{color:#da1100}
 </style></head><body>
 <h1>🦀 Clawd Mochi · WiFi</h1>
 <div id=current></div>
-<h2>Saved networks</h2>
+<h2>已保存的网络</h2>
 <div id=saved></div>
-<h2>Nearby networks</h2>
-<button onclick=scan() class=secondary>🔄 Scan</button>
+<h2>附近的网络</h2>
+<button onclick=scan() class=secondary>🔄 扫描</button>
 <div id=scan></div>
-<h2>Add manually</h2>
+<h2>手动添加</h2>
 <input id=ssid placeholder=SSID>
-<input id=pwd placeholder=Password type=password>
-<button onclick=add()>Save</button>
-<p><a href=/>← Back to controller</a></p>
+<input id=pwd placeholder=密码 type=password>
+<button onclick=add()>保存</button>
+<p><a href=/>← 返回控制台</a></p>
 <script>
 async function load(){
   const r=await fetch('/state');const s=await r.json();
   document.getElementById('current').innerHTML=
-    s.sta?`<div class=card>Connected: <b>${s.sta}</b> (${s.ip}, ${s.rssi}dBm)</div>`
-         :`<div class=card>Not connected — AP-only mode</div>`;
+    s.sta?`<div class=card>已连接：<b>${s.sta}</b>（${s.ip}，${s.rssi}dBm）</div>`
+         :`<div class=card>未连接 — 仅热点模式</div>`;
   const list=await(await fetch('/wifi/list')).json();
   document.getElementById('saved').innerHTML=list.length?list.map(n=>
-    `<div class=card><span>${n.ssid}${n.connected?'<span class=tag>connected</span>':''}</span>
-     <button class=secondary onclick="del('${n.ssid.replace(/'/g,"\\'")}')">delete</button></div>`).join(''):'<div class=card>None yet</div>';
+    `<div class=card><span>${n.ssid}${n.connected?'<span class=tag>已连接</span>':''}</span>
+     <button class=secondary onclick="del('${n.ssid.replace(/'/g,"\\'")}')">删除</button></div>`).join(''):'<div class=card>暂无</div>';
 }
 async function scan(){
-  document.getElementById('scan').innerHTML='Scanning…';
+  document.getElementById('scan').innerHTML='扫描中…';
   const list=await(await fetch('/wifi/scan')).json();
   list.sort((a,b)=>b.rssi-a.rssi);
   document.getElementById('scan').innerHTML=list.map(n=>
-    `<div class=card><span>${n.ssid} <span class=rssi>${n.rssi}dBm</span>${n.saved?'<span class=tag>saved</span>':''}</span>
-     <button onclick="pick('${n.ssid.replace(/'/g,"\\'")}')">use</button></div>`).join('');
+    `<div class=card><span>${n.ssid} <span class=rssi>${n.rssi}dBm</span>${n.saved?'<span class=tag>已保存</span>':''}</span>
+     <button onclick="pick('${n.ssid.replace(/'/g,"\\'")}')">使用</button></div>`).join('');
 }
 function pick(s){document.getElementById('ssid').value=s;document.getElementById('pwd').focus();}
 async function add(){
@@ -2038,7 +2172,7 @@ load();
   server.send_P(200, "text/html", WIFI_HTML);
 }
 
-void routeNotFound() { server.send(404, "text/plain", "not found"); }
+void routeNotFound() { server.send(404, "text/plain", "未找到"); }
 
 // ═════════════════════════════════════════════════════════════
 //  SETUP
@@ -2051,7 +2185,7 @@ void setup() {
   setBacklight(true);
 
   SPI.begin(8, -1, 10, TFT_CS);   // SCK=8, MOSI=10
-  tft.init(240, 240);
+  tft.init(240, 320);
   tft.setSPISpeed(40000000);
   tft.setRotation(1);
   initColours();
@@ -2082,11 +2216,28 @@ void setup() {
   // ── Start WiFi (AP + STA dual mode) ────────────────────────
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
+
   rebuildWifiMulti();
-  // Non-blocking: try connecting in background; we don't sit here
-  // if no networks are saved yet.
-  uint8_t savedCount = loadWifiCount();
-  if (savedCount > 0) wifiMulti.run(5000);
+  // Always add the home/fallback networks from wifi_secrets.h so we connect
+  // even with no saved NVS credentials (and even if AP provisioning fails).
+  for (int i = 0; i < WIFI_GROUP_COUNT; i++) {
+    wifiMulti.addAP(WIFI_GROUP[i].ssid, WIFI_GROUP[i].pass);
+  }
+
+  // NTP: sync real time (UTC+8 = Beijing) for the screensaver clock.
+  // Non-blocking — syncs in the background once STA connects.
+  configTime(8 * 3600, 0, "pool.ntp.org", "ntp1.aliyun.com");
+
+  // Power-only stability: when powered from a charger (no USB host), the
+  // radio init can be flaky and the first connect attempt often fails.
+  // A short settle delay + a few retry attempts improve the success rate.
+  // loop() also retries every 3s if STA stays down, so this is best-effort
+  // and won't block server.begin() for too long if it keeps failing.
+  delay(300);
+  for (int i = 0; i < 3; i++) {
+    if (wifiMulti.run(3000) == WL_CONNECTED) break;
+    delay(400);
+  }
 
   // ── WiFi info screen (stays until first web request) ───────
   tft.fillScreen(C_DARKBG);
@@ -2104,12 +2255,9 @@ void setup() {
     tft.setTextColor(C_GREEN); tft.setTextSize(1);
     tft.setCursor(12, 124); tft.print("STA: " + WiFi.SSID());
     tft.setCursor(12, 138); tft.print("IP : " + WiFi.localIP().toString());
-  } else if (savedCount == 0) {
-    tft.setTextColor(C_MUTED); tft.setTextSize(1);
-    tft.setCursor(12, 124); tft.print("setup STA at /wifi");
   } else {
     tft.setTextColor(C_MUTED); tft.setTextSize(1);
-    tft.setCursor(12, 124); tft.print("STA: scanning...");
+    tft.setCursor(12, 124); tft.print("STA: connect failed");
   }
 
   // ── Register routes ────────────────────────────────────────
@@ -2136,6 +2284,14 @@ void setup() {
   server.on("/wifi/delete",  HTTP_POST, routeWifiDelete);
   server.onNotFound(routeNotFound);
   server.begin();
+
+  // ── mDNS: advertise a stable hostname so the daemon doesn't need a
+  // hard-coded IP that changes with every router (UU→192.168.0.x,
+  // 66yun_wuhan→192.168.100.x, …). The daemon resolves
+  // clawd-mochi.local regardless of which network the device joins.
+  if (MDNS.begin("clawd-mochi")) {
+    MDNS.addService("http", "tcp", 80);
+  }
 
   // ── Captive portal (DNS resolves anything to AP IP) ───────
   // Phones see "no internet" on the AP and auto-open 192.168.4.1
@@ -2179,14 +2335,25 @@ void loop() {
   ArduinoOTA.handle();              // OTA updates
   tickStateMachine();
 
-  // Periodic WiFi rescan: every 5 min, try connecting to the
-  // strongest known network (WiFiMulti handles this internally).
+  // Detect view switches: when we leave the screensaver, clear the
+  // "last drawn view" so the next screensaver entry repaints its background
+  // (other views overwrite the screen with their own fillScreen).
+  if (currentView != VIEW_SCREENSAVER) {
+    lastDrawnView = 255;
+  }
+
+  // WiFi keep-alive:
+  //  - If STA is down, retry every 3s (fast recovery from drops).
+  //  - If STA is up, rescan for strongest network every 5 min.
   uint32_t now = millis();
-  if (now - lastWifiScanMs > WIFI_SCAN_INTERVAL_MS) {
+  bool staUp = (WiFi.status() == WL_CONNECTED);
+  uint32_t interval = staUp ? WIFI_SCAN_INTERVAL_MS : 3000UL;
+  if (now - lastWifiScanMs > interval) {
     lastWifiScanMs = now;
-    if (loadWifiCount() > 0) {
-      wl_status_t s = wifiMulti.run();
-      (void)s; // we don't block — run() is fire-and-forget in async mode
-    }
+    // The WIFI_GROUP networks from wifi_secrets.h were added in setup, so
+    // wifiMulti.run() always has a home network to fall back on even
+    // if NVS has no saved creds.
+    uint8_t s = wifiMulti.run();
+    (void)s; // non-blocking; reselects strongest known network
   }
 }

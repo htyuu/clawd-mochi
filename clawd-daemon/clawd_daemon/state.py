@@ -68,6 +68,10 @@ class StateManager:
 
     def __init__(self) -> None:
         self._status = ClaudeStatus(updated_at=time.time())
+        # When the current transient state (ERROR/AWAITING/DONE) was first
+        # entered. Used by the daemon heartbeat to auto-expire stale states
+        # that would otherwise be held forever by priority-merging.
+        self.transient_since: float = 0.0
 
     @property
     def status(self) -> ClaudeStatus:
@@ -83,12 +87,21 @@ class StateManager:
         new.updated_at = now
 
         # If the current state has higher priority (e.g. ERROR while
-        # new is THINKING), only update non-state fields.
+        # new is THINKING), only update non-state fields — but update
+        # ALL of them (model, git, tokens, session info), not just a few.
+        # Otherwise stale fields (e.g. model="sonnet") persist under DONE.
+        # The transient_since timer is NOT refreshed here, so a low-priority
+        # event arriving during ERROR/AWAITING/DONE does not extend its life.
         if new.state < self._status.state:
             self._status.tool = new.tool
             self._status.task = new.task
             self._status.tokens_used = new.tokens_used
             self._status.tokens_max = new.tokens_max
+            self._status.git_branch = new.git_branch
+            self._status.project = new.project
+            self._status.model = new.model
+            self._status.session_duration_s = new.session_duration_s
+            self._status.tool_count = new.tool_count
             self._status.updated_at = now
             return False
 
@@ -97,14 +110,35 @@ class StateManager:
             or self._status.tool != new.tool
             or self._status.task != new.task
         )
+        # A transition INTO a transient state (or same transient refreshed by
+        # a same-level event) starts the auto-expire timer. Downgrades to
+        # IDLE/THINKING clear it.
+        if new.state in (ClaudeState.ERROR, ClaudeState.AWAITING, ClaudeState.DONE):
+            if old_state != new.state or self.transient_since == 0.0:
+                self.transient_since = now
+        else:
+            self.transient_since = 0.0
         self._status = new
         return changed
 
     def reset(self) -> bool:
-        """Reset to IDLE. Returns True if state actually changed."""
+        """Reset to IDLE, preserving carry-over display fields.
+
+        Only the state and per-tool fields (tool/task/duration_s) are
+        cleared. model, project, git_branch, session_duration_s and
+        tool_count are kept so the device keeps showing "this turn took
+        M:SS, #N tools, model=glm-5.2" during the IDLE that follows a
+        transient state (DONE/AWAITING/ERROR) expiring, instead of
+        flashing blank / zero.
+        """
         if self._status.state == ClaudeState.IDLE:
             return False
-        self._status = ClaudeStatus(updated_at=time.time())
+        self.transient_since = 0.0
+        self._status.state = ClaudeState.IDLE
+        self._status.tool = ""
+        self._status.task = ""
+        self._status.duration_s = 0
+        self._status.updated_at = time.time()
         return True
 
     def tick_heartbeat(self) -> ClaudeStatus | None:

@@ -17,7 +17,14 @@ def _write_transcript(dir_path: Path, sid: str, events: list[dict]) -> Path:
     return p
 
 
-def test_count_basic(tmp_path):
+def test_count_basic_uses_last_context_not_sum(tmp_path):
+    """context_used is the LAST request's input context, not a running sum.
+
+    Each request's input_tokens already contains the full prior conversation,
+    so summing across requests double-counts history. We must report the most
+    recent occupancy only, and exclude output_tokens (those don't occupy the
+    input context window).
+    """
     sid = "test-session"
     events = [
         {
@@ -38,7 +45,8 @@ def test_count_basic(tmp_path):
     ]
     _write_transcript(tmp_path, sid, events)
     used, tmax, model = count_tokens(tmp_path, sid, "sonnet")
-    assert used == 100 + 50 + 200 + 75 + 500
+    # Last request: input 200 + cache_creation 500 (no cache_read) = 700.
+    assert used == 700
     assert tmax == 200_000
     assert model == "sonnet"
 
@@ -58,6 +66,67 @@ def test_count_with_model_name(tmp_path):
     assert used == 50
     assert tmax == 200_000  # comes from opus entry in DEFAULT_MODEL_LIMITS
     assert model == "opus"
+
+
+def test_context_includes_cache_read(tmp_path):
+    """cache_read_input_tokens are part of the current context window too."""
+    sid = "s3"
+    events = [
+        {
+            "message": {
+                "model": "sonnet",
+                "usage": {
+                    "input_tokens": 300,
+                    "cache_read_input_tokens": 12000,
+                    "cache_creation_input_tokens": 800,
+                },
+            }
+        },
+    ]
+    _write_transcript(tmp_path, sid, events)
+    used, tmax, model = count_tokens(tmp_path, sid, "sonnet")
+    assert used == 300 + 12000 + 800
+    assert tmax == 200_000
+
+
+def test_glm_context_window_from_config(tmp_path):
+    """Non-Claude models resolve their limit from the passed model_limits.
+
+    A config entry 'glm' matches model name 'glm-5.2' via substring match.
+    """
+    sid = "s4"
+    events = [
+        {
+            "message": {
+                "model": "glm-5.2",
+                "usage": {"input_tokens": 42000},
+            }
+        },
+    ]
+    _write_transcript(tmp_path, sid, events)
+    limits = {"sonnet": 200_000, "opus": 200_000, "haiku": 200_000, "glm": 1_000_000}
+    used, tmax, model = count_tokens(tmp_path, sid, "sonnet", model_limits=limits)
+    assert used == 42000
+    assert tmax == 1_000_000
+    assert model == "glm-5.2"
+
+
+def test_glm_falls_back_to_default_without_config(tmp_path):
+    """Without a configured limit, glm falls back to the 200k default."""
+    sid = "s5"
+    events = [
+        {
+            "message": {
+                "model": "glm-5.2",
+                "usage": {"input_tokens": 1000},
+            }
+        },
+    ]
+    _write_transcript(tmp_path, sid, events)
+    used, tmax, model = count_tokens(tmp_path, sid, "sonnet")
+    assert used == 1000
+    assert tmax == 200_000
+    assert model == "glm-5.2"
 
 
 def test_empty_session_returns_zeros(tmp_path):

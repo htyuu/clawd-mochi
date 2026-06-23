@@ -23,31 +23,71 @@ def count_tokens(
     claude_dir: Path,
     session_id: str | None,
     model: str = "sonnet",
+    cwd: str | None = None,
+    model_limits: dict[str, int] | None = None,
 ) -> tuple[int, int, str]:
-    """Return (tokens_used, tokens_max, model_name) for the session."""
-    if not session_id:
-        return 0, 200_000, model
+    """Return (context_used, context_max, model_name) for the session.
 
-    transcript_dir = claude_dir / "sessions"
-    if not transcript_dir.exists():
-        return 0, 200_000, model
+    ``context_used`` is the **current context-window occupancy** — the input
+    token count of the most recent request in the transcript
+    (``input_tokens + cache_read_input_tokens + cache_creation_input_tokens``).
+    It is NOT the cumulative tokens consumed by the session: every request's
+    ``input_tokens`` already contains the full prior conversation, so summing
+    across requests would double-count history and report a number far larger
+    than the actual context window. The device progress bar divides this by
+    ``context_max`` to show how full the window is.
 
-    # Look up the model's context limit (we'll override from the file if we
-    # encounter a model stanza).  The caller passes the *default* model;
-    # the file may contain a "model" key.
+    ``context_max`` is the model's context-window size, resolved from
+    ``model_limits`` (the daemon config's ``[model_token_limits]``) by exact
+    match then longest substring match — so a ``glm`` entry matches
+    ``glm-5.2``, and ``sonnet`` matches ``claude-sonnet-4-5-...``.
+
+    Claude Code stores per-project session transcripts at
+    ``~/.claude/projects/<cwd-hash>/<session_id>.jsonl`` where ``<cwd-hash>``
+    is the working directory with every ``/`` replaced by ``-`` (so
+    ``/Users/x/proj`` → ``-Users-x-proj``). The older ``~/.claude/sessions/``
+    location is kept as a fallback.
+    """
     from clawd_daemon.config import DEFAULT_MODEL_LIMITS  # noqa: PLC0415
 
-    tokens_max = DEFAULT_MODEL_LIMITS.get(model, 200_000)
+    limits = model_limits if model_limits is not None else DEFAULT_MODEL_LIMITS
+
+    if not session_id:
+        return 0, _resolve_limit(model, limits), model
+
+    tokens_max = _resolve_limit(model, limits)
     detected_model = model
 
-    candidates = [
-        transcript_dir / f"{session_id}.jsonl",
-    ]
-    candidates.extend(sorted(transcript_dir.glob(f"{session_id}*.jsonl"),
-                             key=lambda p: p.stat().st_mtime, reverse=True))
+    # Build candidate transcript paths. The session transcript lives at
+    # ~/.claude/projects/<launch-dir-hash>/<session_id>.jsonl, but
+    # <launch-dir-hash> is derived from the dir where `claude` was INVOKED
+    # — NOT the hook's cwd (which can be a subdirectory of the launch dir).
+    # So we glob across ALL project dirs by session id (the session id is
+    # unique), then fall back to the cwd-hash dir and the legacy flat
+    # sessions/ dir.
+    candidates: list[Path] = []
+    projects_dir = claude_dir / "projects"
+    if projects_dir.exists():
+        for d in projects_dir.iterdir():
+            if d.is_dir():
+                candidates.extend(d.glob(f"{session_id}*.jsonl"))
+    if cwd:
+        project_hash = cwd.replace("/", "-")
+        candidates.append(claude_dir / "projects" / project_hash / f"{session_id}.jsonl")
+    candidates.append(claude_dir / "sessions" / f"{session_id}.jsonl")
+
+    # Dedupe by path, newest first (read the freshest match)
+    seen: set[Path] = set()
+    uniq: list[Path] = []
+    for p in candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq.append(p)
+    uniq.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
 
     matched = False
-    for transcript_path in candidates:
+    for transcript_path in uniq:
         if not transcript_path.exists():
             continue
         matched = True
@@ -65,10 +105,9 @@ def count_tokens(
                 and not lines[0].startswith("{")):
             lines = lines[1:]
 
-        total_in = 0
-        total_out = 0
-        total_cache_read = 0
-        total_cache_write = 0
+        # Most recent context occupancy found in the tail. We keep the LAST
+        # usage record only (see docstring: summing would double-count history).
+        last_context = 0
 
         for line in lines:
             line = line.strip()
@@ -85,46 +124,86 @@ def count_tokens(
                 obj.get("model", "")                     # raw API
             )
             if model_from_file:
-                # Try to extract the model family short name (sonnet/opus/haiku)
+                # Keep the full model name (e.g. "glm-5.2", "deepseek-v4-pro")
+                # so the device shows the exact model. Claude models still map
+                # to the short family name (sonnet/opus/haiku) for token limits.
                 mf = model_from_file.lower()
+                matched = None
                 for short in ("sonnet", "opus", "haiku"):
                     if short in mf:
-                        detected_model = short
-                        tokens_max = DEFAULT_MODEL_LIMITS.get(short, tokens_max)
+                        matched = short
                         break
-                else:
-                    detected_model = mf
+                detected_model = matched if matched else mf
+                tokens_max = _resolve_limit(detected_model, limits, tokens_max)
 
             usage = obj.get("message", {}).get("usage", {})
             if not usage:
                 usage = obj.get("usage", {})
-            total_in += usage.get("input_tokens", 0)
-            total_out += usage.get("output_tokens", 0)
-            total_cache_read += usage.get("cache_read_input_tokens", 0)
-            total_cache_write += usage.get("cache_creation_input_tokens", 0)
+            if usage:
+                # Current context = the input tokens of this request. output
+                # tokens are NOT part of the input context window, so excluded.
+                last_context = (
+                    usage.get("input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                )
 
-        grand = total_in + total_out + total_cache_read + total_cache_write
-        return grand, tokens_max, detected_model
+        return last_context, tokens_max, detected_model
 
     if not matched:
         log.debug("no transcript file found for session %s", session_id)
     return 0, tokens_max, detected_model
 
 
+def _resolve_limit(
+    model_name: str, limits: dict[str, int] | None, default: int = 200_000
+) -> int:
+    """Context-window limit for a model name.
+
+    Exact match first, then the longest configured key that is a substring of
+    the (lower-cased) model name — so ``glm`` matches ``glm-5.2`` and
+    ``sonnet`` matches ``claude-sonnet-4-5-...``. Falls back to ``default``.
+    """
+    if not model_name:
+        return default
+    name = model_name.lower()
+    limits = limits or {}
+    if name in limits:
+        return limits[name]
+    best_key = ""
+    best_val = default
+    for k, v in limits.items():
+        kl = k.lower()
+        if kl and kl in name and len(kl) > len(best_key):
+            best_key = kl
+            best_val = v
+    return best_val
+
+
 def find_latest_session_id(claude_dir: Path) -> str | None:
-    """Return the most-recently-written session ID from the sessions dir,
-    or None if empty."""
+    """Return the most-recently-written session ID.
+
+    Scans the per-project transcript dir ``~/.claude/projects/*/*.jsonl``
+    (Claude Code's actual location) and falls back to the flat
+    ``~/.claude/sessions/`` dir.
+    """
+    search_dirs: list[Path] = []
+    projects_dir = claude_dir / "projects"
+    if projects_dir.exists():
+        search_dirs.extend(p for p in projects_dir.iterdir() if p.is_dir())
     sessions_dir = claude_dir / "sessions"
-    if not sessions_dir.exists():
-        return None
+    if sessions_dir.exists():
+        search_dirs.append(sessions_dir)
+
     latest = None
-    latest_mtime = 0
-    for f in sessions_dir.glob("*.jsonl"):
+    latest_mtime = 0.0
+    for d in search_dirs:
         try:
-            mtime = f.stat().st_mtime
-            if mtime > latest_mtime:
-                latest_mtime = mtime
-                latest = f.stem
+            for f in d.glob("*.jsonl"):
+                mtime = f.stat().st_mtime
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest = f.stem
         except OSError:
             continue
     return latest

@@ -341,16 +341,25 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     const buckets = tlData.buckets;
     const max = Math.max(...buckets.map(b => b.count), 1);
+    const maxTokens = Math.max(...buckets.map(b => b.tokens || 0), 1);
     const barW = Math.max(4, Math.min(14, (w - 40) / Math.max(1, buckets.length)));
     buckets.forEach((b, i) => {
       const x = 20 + i * (barW + 2);
-      const barH = (b.count / max) * (h - 30);
+      const barH = (b.count / max) * (h - 40);
       ctx.fillStyle = bucketColor(b);
       ctx.fillRect(x, h - 15 - barH, barW, barH);
+      // Token consumption cap (green) stacked on top of the count bar —
+      // height proportional to this bucket's tokens vs the day's max.
+      if (b.tokens > 0) {
+        const tokH = (b.tokens / maxTokens) * 18;
+        ctx.fillStyle = 'rgba(34, 197, 94, 0.9)';
+        ctx.fillRect(x, h - 15 - barH - tokH, barW, tokH);
+      }
       if (hoverTs === b.ts) {
         ctx.strokeStyle = '#fff';
         ctx.lineWidth = 2;
-        ctx.strokeRect(x - 1, h - 16 - barH, barW + 2, barH + 2);
+        const totalH = barH + (b.tokens > 0 ? (b.tokens / maxTokens) * 18 : 0);
+        ctx.strokeRect(x - 1, h - 16 - totalH, barW + 2, totalH + 2);
       }
     });
   }
@@ -373,6 +382,9 @@ document.addEventListener('DOMContentLoaded', () => {
         $('tl-tool').textContent = b.top_tool || '--';
         $('tl-count').textContent = b.count;
         $('tl-err').textContent = b.errors;
+        $('tl-tokens').textContent = b.tokens > 0
+          ? (b.tokens / 1000).toFixed(b.tokens >= 10000 ? 0 : 1) + 'k'
+          : '0';
         // Enable replay button now that we have a target bucket selected
         $('tl-replay').disabled = false;
         $('tl-replay').dataset.state = b.state || (b.errors > 0 ? 'error' : 'thinking');

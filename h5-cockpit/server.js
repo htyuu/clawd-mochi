@@ -26,6 +26,42 @@ function daemonFetch(path) {
   });
 }
 
+/**
+ * POST a JSON payload to a daemon event endpoint and reply to the cockpit
+ * client exactly once.
+ *
+ * Guards against the double-response crash where a request timeout's
+ * postReq.destroy() also fires the 'error' handler — without the guard both
+ * would call res.json() and throw ERR_HTTP_HEADERS_SENT, killing the process.
+ * reply() runs before destroy() so the client sees "daemon timeout" rather
+ * than the less-accurate "daemon unreachable".
+ */
+function forwardToDaemon(res, endpoint, payload) {
+  const url = new URL(DAEMON_URL + endpoint);
+  let replied = false;
+  const reply = (obj) => {
+    if (replied || res.headersSent) return;
+    replied = true;
+    res.json(obj);
+  };
+  const postReq = http.request({
+    hostname: url.hostname,
+    port:     url.port,
+    path:     url.pathname,
+    method:   'POST',
+    headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    timeout:  1000,
+  }, response => {
+    let data = '';
+    response.on('data', c => data += c);
+    response.on('end', () => reply({ ok: true, daemon_response: data }));
+  });
+  postReq.on('error',   () => reply({ ok: false, error: 'daemon unreachable' }));
+  postReq.on('timeout', () => { reply({ ok: false, error: 'daemon timeout' }); postReq.destroy(); });
+  postReq.write(payload);
+  postReq.end();
+}
+
 const Database = require('better-sqlite3');
 
 // --- Cockpit own DB ---
@@ -213,23 +249,7 @@ app.post('/api/replay', (req, res) => {
     ? '{}'
     : JSON.stringify({ tool: 'replay:' + state, cwd: process.cwd() });
 
-  const url = new URL(DAEMON_URL + endpoint);
-  const postReq = http.request({
-    hostname: url.hostname,
-    port:     url.port,
-    path:     url.pathname,
-    method:   'POST',
-    headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-    timeout:  1000,
-  }, response => {
-    let data = '';
-    response.on('data', c => data += c);
-    response.on('end', () => res.json({ ok: true, daemon_response: data }));
-  });
-  postReq.on('error',   () => res.json({ ok: false, error: 'daemon unreachable' }));
-  postReq.on('timeout', () => { postReq.destroy(); res.json({ ok: false, error: 'daemon timeout' }); });
-  postReq.write(payload);
-  postReq.end();
+  forwardToDaemon(res, endpoint, payload);
 });
 
 app.post('/api/control', (req, res) => {
@@ -247,25 +267,7 @@ app.post('/api/control', (req, res) => {
         task: task || '',
       });
 
-  const url = new URL(DAEMON_URL + endpoint);
-  const opts = {
-    hostname: url.hostname,
-    port:     url.port,
-    path:     url.pathname,
-    method:   'POST',
-    headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-    timeout:  1000,
-  };
-
-  const postReq = http.request(opts, response => {
-    let data = '';
-    response.on('data', c => data += c);
-    response.on('end', () => res.json({ ok: true, daemon_response: data }));
-  });
-  postReq.on('error',   () => res.json({ ok: false, error: 'daemon unreachable' }));
-  postReq.on('timeout', () => { postReq.destroy(); res.json({ ok: false, error: 'daemon timeout' }); });
-  postReq.write(payload);
-  postReq.end();
+  forwardToDaemon(res, endpoint, payload);
 });
 
 app.get('/api/timeline', (req, res) => {
@@ -289,7 +291,7 @@ app.get('/api/timeline', (req, res) => {
   const BUCKET_SEC = 300;
   const buckets = [];
   for (let i = 0; i < 288; i++) {
-    buckets.push({ ts: startTs + i * BUCKET_SEC, tools: [], errors: 0, count: 0 });
+    buckets.push({ ts: startTs + i * BUCKET_SEC, tools: [], errors: 0, count: 0, tokens: 0 });
   }
 
   for (const r of rows) {
@@ -297,6 +299,7 @@ app.get('/api/timeline', (req, res) => {
     buckets[idx].tools.push(r.tool);
     if (!r.success) buckets[idx].errors++;
     buckets[idx].count++;
+    buckets[idx].tokens += r.tokens || 0;
   }
 
   // Compress: only return non-empty buckets
@@ -315,6 +318,7 @@ app.get('/api/timeline', (req, res) => {
       ts:       b.ts,
       count:    b.count,
       errors:   b.errors,
+      tokens:   b.tokens,
       top_tool: topTool,
       state,
     };

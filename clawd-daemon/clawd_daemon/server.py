@@ -72,7 +72,6 @@ class Daemon:
             self._working_dir = cwd
         self._tool_start_ts = time.time()
 
-        # Collect task title from todo
         # Claude Code hooks send `session_id` (snake_case); accept both.
         sid = payload.get("session_id") or payload.get("sessionId") or ""
         if not sid:
@@ -80,6 +79,12 @@ class Daemon:
             # where the boot-discovered session is now stale.
             sid = token_counter.find_latest_session_id(self.cfg.claude_dir) or self._current_session
         if sid:
+            # When the active session changes (e.g. user switched project
+            # windows), reset the per-turn clock so the new session's
+            # duration starts fresh.
+            if sid != self._current_session:
+                self._session_start_ts = 0.0
+                self._tool_count = 0
             self._current_session = sid
         task = todo_reader.read_active(self.cfg.claude_dir, self._current_session)
 
@@ -140,15 +145,13 @@ class Daemon:
             cwd=cwd,
             model_limits=self.cfg.model_token_limits,
         )
-        # Per-tool token delta (transcript-based) — this is what feeds the
-        # cockpit timeline's token consumption. Using the cumulative count
-        # would double-count; the delta captures tokens consumed since the
-        # last tool finished. First call has no baseline → 0 (avoid spike).
+        # Per-tool token delta (transcript-based)
         delta = (used - self._last_token_used) if (
             self._last_token_used > 0 and used >= self._last_token_used
         ) else 0
         self._last_token_used = used
 
+        # Record to storage for any session (local DB write is safe).
         self.storage.record_tool(
             tool, success=success, tokens=delta,
             session=self._current_session,
@@ -298,10 +301,11 @@ class Daemon:
             await asyncio.sleep(self.cfg.heartbeat_interval_s)
             # Auto-expire transient states (ERROR/AWAITING/DONE) so the device
             # doesn't get stuck on a stale high-priority colour if no further
-            # hook event arrives (e.g. the ESP32 firmware lacks an awaiting
-            # timeout, or a Stop/idle notification was missed). THINKING is
-            # NOT expired here — its end is signalled by post_tool/stop, and
-            # expiring it mid-tool would flip the device off "thinking" blue.
+            # hook event arrives. Also expire orphan THINKING: if we've been
+            # in THINKING for >120s with no tool progress (e.g. a conversation
+            # was abandoned or the window was closed before firing Stop),
+            # reset to IDLE so the device isn't frozen blue forever and the
+            # screensaver can eventually activate.
             s = self.state.status.state
             if s in (ClaudeState.ERROR, ClaudeState.AWAITING, ClaudeState.DONE):
                 timeout = {
@@ -312,6 +316,16 @@ class Daemon:
                 since = self.state.transient_since
                 if since > 0 and time.time() - since > timeout:
                     log.info("transient %s expired after %.0fs → IDLE", s.name, timeout)
+                    if self.state.reset():
+                        await self._push(force=True)
+                    continue
+            if s == ClaudeState.THINKING:
+                if self._tool_start_ts > 0 and time.time() - self._tool_start_ts > 120.0:
+                    log.info(
+                        "orphan THINKING after %.0fs → IDLE",
+                        time.time() - self._tool_start_ts,
+                    )
+                    self._turn_active = False
                     if self.state.reset():
                         await self._push(force=True)
                     continue

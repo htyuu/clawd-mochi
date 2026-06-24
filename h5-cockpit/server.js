@@ -164,22 +164,36 @@ app.get('/api/year', (req, res) => {
     default:      startDate = new Date(now); startDate.setFullYear(now.getFullYear() - 1); break;
   }
 
-  const start = startDate.toISOString().slice(0, 10);
+  // Aggregate directly from tool_events (not daily_stats) so we get the
+  // tokens_cached split in real time for today, and the per-tool tokens field
+  // (non-cached cost) for history. daily_stats lacks tokens_cached for rows
+  // written before the column was added, and isn't aggregated until midnight,
+  // so today's numbers would be missing from it. tool_events is pruned to 90d,
+  // so year-range early days may be empty — acceptable since token stats are
+  // most useful for recent ranges.
+  const startTs = Math.floor(startDate.getTime() / 1000);
 
   const rows = queryDaemonDb(
-    "SELECT date, tools_called, tokens_total, sessions, errors FROM daily_stats WHERE date >= ? ORDER BY date",
-    [start]
+    "SELECT date(ts,'unixepoch','localtime') as day, "
+    + "COUNT(*) as tools_called, "
+    + "COALESCE(SUM(tokens), 0) as tokens_total, "
+    + "COALESCE(SUM(tokens_cached), 0) as tokens_cached, "
+    + "COUNT(DISTINCT session) as sessions, "
+    + "SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) as errors "
+    + "FROM tool_events WHERE ts >= ? GROUP BY day ORDER BY day",
+    [startTs]
   );
   if (rows === null || rows.length === 0)
     return res.json({ empty: true, range, trend: [] });
 
   const summary = rows.reduce((acc, r) => {
-    acc.tools_called += r.tools_called || 0;
-    acc.tokens_total += r.tokens_total || 0;
-    acc.sessions += r.sessions || 0;
-    acc.errors += r.errors || 0;
+    acc.tools_called  += r.tools_called || 0;
+    acc.tokens_total  += r.tokens_total || 0;
+    acc.tokens_cached += r.tokens_cached || 0;
+    acc.sessions     += r.sessions || 0;
+    acc.errors       += r.errors || 0;
     return acc;
-  }, { tools_called: 0, tokens_total: 0, sessions: 0, errors: 0 });
+  }, { tools_called: 0, tokens_total: 0, tokens_cached: 0, sessions: 0, errors: 0 });
 
   const busiest = rows.reduce((a, b) => (a.tools_called >= b.tools_called ? a : b));
 
@@ -187,8 +201,8 @@ app.get('/api/year', (req, res) => {
     empty: false,
     range,
     summary,
-    trend: rows.map(r => ({ date: r.date, tools: r.tools_called || 0, tokens: r.tokens_total || 0 })),
-    top: { busiest_day: busiest.date, busiest_calls: busiest.tools_called || 0 },
+    trend: rows.map(r => ({ date: r.day, tools: r.tools_called || 0, tokens: r.tokens_total || 0, tokens_cached: r.tokens_cached || 0 })),
+    top: { busiest_day: busiest.day, busiest_calls: busiest.tools_called || 0 },
   });
 });
 

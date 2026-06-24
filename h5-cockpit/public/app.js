@@ -466,6 +466,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (d.empty || !d.summary) {
         $('yr-tools').textContent = '--';
         $('yr-tokens').textContent = '--';
+        $('yr-tokens-cached').textContent = '--';
         $('yr-sessions').textContent = '--';
         $('yr-chart').innerHTML = '<div style="color:#64748b;font-size:13px;align-self:center;">暂无</div>';
         $('yr-top').textContent = '暂无数据';
@@ -473,9 +474,13 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
       const sum = d.summary;
+      // Format a token count: >=1M → "12.3M", >=1k → "12k", else raw.
+      const fmtTok = n => n >= 1_000_000
+        ? (n / 1_000_000).toFixed(1) + 'M'
+        : (n >= 1000 ? Math.round(n / 1000) + 'k' : n);
       $('yr-tools').textContent = sum.tools_called;
-      $('yr-tokens').textContent = sum.tokens_total >= 1000
-        ? Math.round(sum.tokens_total / 1000) + 'k' : sum.tokens_total;
+      $('yr-tokens').textContent = fmtTok(sum.tokens_total || 0);
+      $('yr-tokens-cached').textContent = fmtTok(sum.tokens_cached || 0);
       $('yr-sessions').textContent = sum.sessions;
 
       const trend = d.trend || [];

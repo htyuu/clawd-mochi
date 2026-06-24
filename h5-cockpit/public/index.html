@@ -125,9 +125,10 @@
       <button class="year-subtab" data-range="month">📅 月报</button>
       <button class="year-subtab" data-range="year">📅 年报</button>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px;">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
       <div class="stat-card"><div class="num" id="yr-tools">--</div><div class="lbl">工具调用</div></div>
-      <div class="stat-card"><div class="num" id="yr-tokens">--</div><div class="lbl">Token</div></div>
+      <div class="stat-card"><div class="num" id="yr-tokens">--</div><div class="lbl">未命中缓存</div></div>
+      <div class="stat-card"><div class="num" id="yr-tokens-cached">--</div><div class="lbl">命中缓存</div></div>
       <div class="stat-card"><div class="num" id="yr-sessions">--</div><div class="lbl">会话</div></div>
     </div>
     <div class="trend-chart" id="yr-chart"></div>

@@ -86,6 +86,15 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // ─── Status polling (every 2s) ───────────────────────
+  // Debounce daemon-down detection: a single slow /health (daemon busy with
+  // token globbing, a git subprocess, or an ESP32 push storm) used to flip
+  // the "daemon 未连接" banner on for ~1-2s then off again. We require
+  // DOWN_THRESHOLD consecutive failures before declaring the daemon down,
+  // and any single success resets it. Polls at 2s, so threshold of 3 ≈ 6s of
+  // sustained unreachability before the banner shows.
+  const DOWN_THRESHOLD = 3;
+  let downStreak = 0;
+
   async function pollStatus() {
     try {
       const res = await fetch('/api/status');
@@ -95,17 +104,22 @@ document.addEventListener('DOMContentLoaded', () => {
       const banner = $('error-banner');
 
       if (!s.daemon) {
-        indicator.className = 'status-down';
-        text.textContent = 'daemon ❌';
-        banner.classList.add('show');
-        $('error-text').textContent = 'daemon 未连接，遥控暂时无法工作（颜色按钮仍可用于本地预览）';
-        // Disable only daemon-dependent buttons (emotes/presets/rituals).
-        // Color buttons stay enabled — they preview locally.
-        document.querySelectorAll('.emo-btn[data-emote], .preset-btn, .ritual-btn')
-          .forEach(b => { b.disabled = true; b.style.opacity = '.5'; });
+        downStreak++;
+        if (downStreak >= DOWN_THRESHOLD) {
+          indicator.className = 'status-down';
+          text.textContent = 'daemon ❌';
+          banner.classList.add('show');
+          $('error-text').textContent = 'daemon 未连接，遥控暂时无法工作（颜色按钮仍可用于本地预览）';
+          // Disable only daemon-dependent buttons (emotes/presets/rituals).
+          // Color buttons stay enabled — they preview locally.
+          document.querySelectorAll('.emo-btn[data-emote], .preset-btn, .ritual-btn')
+            .forEach(b => { b.disabled = true; b.style.opacity = '.5'; });
+        }
         return;
       }
 
+      // Daemon reachable — reset streak, hide banner.
+      downStreak = 0;
       indicator.className = 'status-ok';
       text.textContent = 'daemon ✅';
       banner.classList.remove('show');
@@ -123,8 +137,13 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     } catch (e) {
       warn('pollStatus', e);
-      $('status-indicator').className = 'status-down';
-      $('status-text').textContent = 'daemon ❌';
+      // Network error to our own cockpit server — don't flip the daemon
+      // banner on a single miss either; the streak stays where it was.
+      downStreak++;
+      if (downStreak >= DOWN_THRESHOLD) {
+        $('status-indicator').className = 'status-down';
+        $('status-text').textContent = 'daemon ❌';
+      }
     }
   }
 
@@ -217,13 +236,22 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // ─── Rituals ─────────────────────────────────────────
+  // Beijing calendar day as YYYY-MM-DD. new Date() is local but toISOString()
+  // is UTC, so we shift +8h before slicing — matches the backend's
+  // date(created_at, '+8 hours') so a ritual logged at Beijing 06:00 is
+  // grouped under the Beijing day the user experienced.
+  function beijingDay(offsetDays = 0) {
+    const t = new Date(Date.now() + 8 * 3600 * 1000 + offsetDays * 86400 * 1000);
+    return t.toISOString().slice(0, 10);
+  }
+
   async function loadRituals() {
     try {
       const [r1, r2] = await Promise.all([fetch('/api/rituals'), fetch('/api/rituals/streak')]);
       const d = await r1.json();
       const s = await r2.json();
 
-      const today = new Date().toISOString().slice(0, 10);
+      const today = beijingDay();
       const todays = (d.days && d.days[today]) || [];
       ['morning', 'lunch', 'night', 'offwork'].forEach(type => {
         const done = todays.find(r => r.type === type);
@@ -235,12 +263,10 @@ document.addEventListener('DOMContentLoaded', () => {
       $('streak-night').textContent = s.night || 0;
       $('streak-all').textContent = s.all_four || 0;
 
-      // Heatmap (last 90 days)
+      // Heatmap (last 90 days, Beijing calendar)
       const cells = [];
       for (let i = 89; i >= 0; i--) {
-        const dt = new Date();
-        dt.setDate(dt.getDate() - i);
-        const ds = dt.toISOString().slice(0, 10);
+        const ds = beijingDay(-i);
         const r = (d.days && d.days[ds]) || [];
         const cnt = Math.min(4, r.length);
         cells.push(`<div class="cell cell-${cnt}" title="${ds}: ${cnt} 仪式 (${r.map(x => x.type).join(', ')})"></div>`);

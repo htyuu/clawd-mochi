@@ -13,7 +13,12 @@ const DAEMON_URL = 'http://127.0.0.1:7878';
 
 function daemonFetch(path) {
   return new Promise(resolve => {
-    const req = http.get(DAEMON_URL + path, { timeout: 1000 }, res => {
+    // 2.5s gives headroom for daemon event-loop hitches (token globbing,
+    // git subprocess, ESP32 push storms) without making a single poll
+    // take longer than the 2s frontend poll interval by too much. The
+    // frontend debounces (consecutive-failure threshold) so a lone slow
+    // /health no longer flips the "daemon down" banner.
+    const req = http.get(DAEMON_URL + path, { timeout: 2500 }, res => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
@@ -329,11 +334,15 @@ app.get('/api/timeline', (req, res) => {
 
 app.get('/api/rituals', (req, res) => {
   const days = parseInt(req.query.days) || 90;
+  // Cutoff in Beijing time (UTC+8). created_at is stored in UTC (SQLite
+  // CURRENT_TIMESTAMP), so we shift +8h before date() so a ritual logged at
+  // Beijing 06:00 (UTC 22:00 prev day) is grouped under the Beijing calendar
+  // day the user actually experienced, not the UTC day.
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - days);
 
   const rows = cockpitDb.prepare(
-    "SELECT type, date(created_at) as day, time(created_at) as time FROM ritual_logs WHERE created_at >= ? ORDER BY created_at"
+    "SELECT type, date(created_at, '+8 hours') as day, time(created_at, '+8 hours') as time FROM ritual_logs WHERE created_at >= ? ORDER BY created_at"
   ).all(cutoff.toISOString());
 
   // Group by day
@@ -364,24 +373,36 @@ app.post('/api/rituals', (req, res) => {
 });
 
 app.get('/api/rituals/streak', (req, res) => {
+  // Group by Beijing calendar day (created_at is UTC; +8h shifts to CST).
   const rows = cockpitDb.prepare(
-    "SELECT DISTINCT type, date(created_at) as day FROM ritual_logs ORDER BY day DESC"
+    "SELECT DISTINCT type, date(created_at, '+8 hours') as day FROM ritual_logs ORDER BY day DESC"
   ).all();
+
+  // Beijing "today" as YYYY-MM-DD. toISOString() is UTC, so we build the
+  // Beijing date manually from getUTC* + 8h rollover instead.
+  function beijingToday() {
+    const d = new Date();
+    const t = new Date(d.getTime() + 8 * 3600 * 1000);
+    return t.toISOString().slice(0, 10);
+  }
+
+  function beijingDayOffset(offsetDays) {
+    const d = new Date();
+    const t = new Date(d.getTime() + 8 * 3600 * 1000 + offsetDays * 86400 * 1000);
+    return t.toISOString().slice(0, 10);
+  }
 
   function calcStreak(type) {
     let streak = 0;
     const typeDays = new Set(rows.filter(r => r.type === type).map(r => r.day));
     for (let i = 0; i < 365; i++) {
-      const d = new Date();
-      d.setDate(d.getDate() - i);
-      const ds = d.toISOString().slice(0, 10);
-      if (typeDays.has(ds)) streak++;
+      if (typeDays.has(beijingDayOffset(-i))) streak++;
       else break;
     }
     return streak;
   }
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = beijingToday();
   const todayTypes = rows.filter(r => r.day === today).map(r => r.type);
   const allToday = ['morning', 'lunch', 'night', 'offwork'].every(t => todayTypes.includes(t));
 

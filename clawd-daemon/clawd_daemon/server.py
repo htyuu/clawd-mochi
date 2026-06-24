@@ -34,6 +34,7 @@ class Daemon:
         self._midnight_task: asyncio.Task | None = None
         self._duration_task: asyncio.Task | None = None
         self._last_state_snapshot: str = ""
+        self._last_push_ts: float = 0.0  # for IDLE heartbeat throttling
         self._current_session: str = ""
         self._working_dir: str = ""
         self._tool_start_ts: float = 0.0
@@ -71,6 +72,16 @@ class Daemon:
         if cwd:
             self._working_dir = cwd
         self._tool_start_ts = time.time()
+
+        # If the device is stuck on a transient state (DONE/AWAITING/ERROR)
+        # from a previous turn — e.g. Stop fired, or a permission prompt was
+        # abandoned — a new tool call means that turn is over. Clear the
+        # transient first so this THINKING isn't suppressed by priority
+        # merging (DONE=2 > THINKING=1) and the device shows "thinking"
+        # instead of staying stuck on the previous turn's colour.
+        cur = self.state.status.state
+        if cur in (ClaudeState.DONE, ClaudeState.AWAITING, ClaudeState.ERROR):
+            self.state.reset()
 
         # Claude Code hooks send `session_id` (snake_case); accept both.
         sid = payload.get("session_id") or payload.get("sessionId") or ""
@@ -290,15 +301,43 @@ class Daemon:
     # -- Push + heartbeat -----------------------------------------------
 
     async def _push(self, *, force: bool = False) -> None:
-        pushed = await self.client.push_status(
-            self.state.status.to_payload(), force=force
-        )
+        # Time-box the push so a hung ESP32 POST can't block the heartbeat
+        # loop forever (which would strand the state machine on a stale
+        # transient state). 8s > the client's own 6s timeout + retry, so under
+        # normal operation this never fires; it only catches the case where
+        # the client's await itself wedges.
+        try:
+            pushed = await asyncio.wait_for(
+                self.client.push_status(
+                    self.state.status.to_payload(), force=force
+                ),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning("push timed out after 8s (skipping)")
+            return
         if pushed:
+            self._last_push_ts = time.time()
             log.debug("pushed: %s", self.state.status.state.name)
 
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.cfg.heartbeat_interval_s)
+            await self._heartbeat_tick()
+
+    async def _heartbeat_tick(self) -> None:
+        """One heartbeat iteration.
+
+        Split out from the loop so each tick is isolated: an exception or a
+        stuck ``await self._push()`` in one tick is caught here and cannot
+        kill the whole heartbeat task (which would strand the state machine
+        on a stale transient state forever, since nothing else expires it).
+
+        The expire-checks run BEFORE any push, and reset() is synchronous
+        (no await), so even if the trailing push hangs the next tick will
+        still observe the post-reset IDLE state.
+        """
+        try:
             # Auto-expire transient states (ERROR/AWAITING/DONE) so the device
             # doesn't get stuck on a stale high-priority colour if no further
             # hook event arrives. Also expire orphan THINKING: if we've been
@@ -318,7 +357,7 @@ class Daemon:
                     log.info("transient %s expired after %.0fs → IDLE", s.name, timeout)
                     if self.state.reset():
                         await self._push(force=True)
-                    continue
+                    return
             if s == ClaudeState.THINKING:
                 if self._tool_start_ts > 0 and time.time() - self._tool_start_ts > 120.0:
                     log.info(
@@ -328,7 +367,7 @@ class Daemon:
                     self._turn_active = False
                     if self.state.reset():
                         await self._push(force=True)
-                    continue
+                    return
             s = self.state.status.state
             if s != ClaudeState.IDLE:
                 # Non-idle: push every heartbeat (keeps duration/tool fresh).
@@ -342,6 +381,8 @@ class Daemon:
                 now = time.time()
                 if now - self._last_push_ts > self.IDLE_HEARTBEAT_S:
                     await self._push(force=True)
+        except Exception:  # noqa: BLE001
+            log.exception("heartbeat tick failed (will retry next interval)")
 
     async def _duration_loop(self) -> None:
         """Keep duration_s (per-tool) and session_duration_s (per-turn) live.

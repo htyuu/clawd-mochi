@@ -901,9 +901,21 @@ void drawScreenSaverView() {
 // ═════════════════════════════════════════════════════════════
 
 void applyStatus(const ClaudeStatus& incoming) {
-  // Any incoming status counts as activity (wake from screensaver)
-  lastInteractionMs = millis();
-  if (currentView == VIEW_SCREENSAVER) {
+  // Repeated IDLE heartbeats keep daemon-online fields fresh, but they should
+  // not reset the screensaver timer. Treat real work/status changes as activity.
+  bool statusActivity = (incoming.state != CS_IDLE ||
+                         incoming.state != claudeStatus.state ||
+                         incoming.tool       != claudeStatus.tool ||
+                         incoming.task       != claudeStatus.task ||
+                         incoming.project    != claudeStatus.project ||
+                         incoming.git_branch != claudeStatus.git_branch ||
+                         incoming.model      != claudeStatus.model ||
+                         incoming.tool_count != claudeStatus.tool_count ||
+                         incoming.session_duration_s != claudeStatus.session_duration_s);
+  if (statusActivity) {
+    lastInteractionMs = millis();
+  }
+  if (statusActivity && currentView == VIEW_SCREENSAVER) {
     currentView = previousView;
   }
   // Only force a full frame repaint if the static text or state actually

@@ -44,7 +44,7 @@ def test_count_basic_uses_last_context_not_sum(tmp_path):
         },
     ]
     _write_transcript(tmp_path, sid, events)
-    used, tmax, model = count_tokens(tmp_path, sid, "sonnet")
+    used, tmax, model, _cost, _cached = count_tokens(tmp_path, sid, "sonnet")
     # Last request: input 200 + cache_creation 500 (no cache_read) = 700.
     assert used == 700
     assert tmax == 200_000
@@ -62,7 +62,7 @@ def test_count_with_model_name(tmp_path):
         },
     ]
     _write_transcript(tmp_path, sid, events)
-    used, tmax, model = count_tokens(tmp_path, sid, "sonnet")
+    used, tmax, model, _cost, _cached = count_tokens(tmp_path, sid, "sonnet")
     assert used == 50
     assert tmax == 200_000  # comes from opus entry in DEFAULT_MODEL_LIMITS
     assert model == "opus"
@@ -84,9 +84,40 @@ def test_context_includes_cache_read(tmp_path):
         },
     ]
     _write_transcript(tmp_path, sid, events)
-    used, tmax, model = count_tokens(tmp_path, sid, "sonnet")
+    used, tmax, model, _cost, _cached = count_tokens(tmp_path, sid, "sonnet")
     assert used == 300 + 12000 + 800
     assert tmax == 200_000
+
+
+def test_last_request_cost_excludes_cache_read(tmp_path):
+    """last_request_cost = input + output + cache_creation (no cache_read).
+
+    cache_read is a cache hit — reusing already-cached context is not new
+    consumption, so it must not inflate the per-tool cost recorded in the
+    cockpit timeline / year stats.
+    """
+    sid = "s6"
+    events = [
+        {
+            "message": {
+                "model": "sonnet",
+                "usage": {
+                    "input_tokens": 300,
+                    "output_tokens": 120,
+                    "cache_read_input_tokens": 12000,
+                    "cache_creation_input_tokens": 800,
+                },
+            }
+        },
+    ]
+    _write_transcript(tmp_path, sid, events)
+    used, tmax, model, cost, cached = count_tokens(tmp_path, sid, "sonnet")
+    # context = 300 + 12000 + 800 (includes cache_read)
+    assert used == 13100
+    # cost = 300 + 120 + 800 (excludes cache_read)
+    assert cost == 300 + 120 + 800
+    # cached = cache_read only
+    assert cached == 12000
 
 
 def test_glm_context_window_from_config(tmp_path):
@@ -105,7 +136,7 @@ def test_glm_context_window_from_config(tmp_path):
     ]
     _write_transcript(tmp_path, sid, events)
     limits = {"sonnet": 200_000, "opus": 200_000, "haiku": 200_000, "glm": 1_000_000}
-    used, tmax, model = count_tokens(tmp_path, sid, "sonnet", model_limits=limits)
+    used, tmax, model, _cost, _cached = count_tokens(tmp_path, sid, "sonnet", model_limits=limits)
     assert used == 42000
     assert tmax == 1_000_000
     assert model == "glm-5.2"
@@ -123,21 +154,21 @@ def test_glm_falls_back_to_default_without_config(tmp_path):
         },
     ]
     _write_transcript(tmp_path, sid, events)
-    used, tmax, model = count_tokens(tmp_path, sid, "sonnet")
+    used, tmax, model, _cost, _cached = count_tokens(tmp_path, sid, "sonnet")
     assert used == 1000
     assert tmax == 200_000
     assert model == "glm-5.2"
 
 
 def test_empty_session_returns_zeros(tmp_path):
-    used, tmax, model = count_tokens(tmp_path, "nonexistent", "haiku")
+    used, tmax, model, _cost, _cached = count_tokens(tmp_path, "nonexistent", "haiku")
     assert used == 0
     assert tmax == 200_000
     assert model == "haiku"
 
 
 def test_no_session_id():
-    used, tmax, model = count_tokens(Path("."), None, "sonnet")
+    used, tmax, model, _cost, _cached = count_tokens(Path("."), None, "sonnet")
     assert used == 0
     assert tmax == 200_000
     assert model == "sonnet"

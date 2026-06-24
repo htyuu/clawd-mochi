@@ -108,7 +108,7 @@ class Daemon:
         self._tool_count += 1
 
         # Token count + model
-        used, tmax, model = token_counter.count_tokens(
+        used, tmax, model, _cost, _cached = token_counter.count_tokens(
             self.cfg.claude_dir, self._current_session,
             cwd=cwd or self._working_dir,
             model_limits=self.cfg.model_token_limits,
@@ -151,20 +151,23 @@ class Daemon:
         success = not err
 
         cwd = payload.get("cwd", "") or self._working_dir
-        used, tmax, _ = token_counter.count_tokens(
+        used, tmax, _, cost, cached = token_counter.count_tokens(
             self.cfg.claude_dir, self._current_session,
             cwd=cwd,
             model_limits=self.cfg.model_token_limits,
         )
-        # Per-tool token delta (transcript-based)
-        delta = (used - self._last_token_used) if (
-            self._last_token_used > 0 and used >= self._last_token_used
-        ) else 0
+        # Per-tool token split from the most recent request in the transcript
+        # (by PostToolUse time this should be this tool's request):
+        #   cost   = input + output + cache_creation (non-cached, processed fresh)
+        #   cached = cache_read (cache-hit portion of conversation history)
+        # Previously this used (used - last_used) which logged the entire
+        # accumulated context as the first tool's cost after a daemon restart,
+        # and recorded huge phantom deltas whenever the context jumped.
         self._last_token_used = used
 
         # Record to storage for any session (local DB write is safe).
         self.storage.record_tool(
-            tool, success=success, tokens=delta,
+            tool, success=success, tokens=cost, tokens_cached=cached,
             session=self._current_session,
         )
 
@@ -192,18 +195,38 @@ class Daemon:
             await self._push()
 
     async def on_stop(self, payload: dict) -> None:
-        """Claude Code finished the current run."""
+        """Claude Code finished the current run.
+
+        Goes straight to IDLE (orange) — NOT DONE (green). A real Stop means
+        the conversation turn is over and the device should relax to idle,
+        not flash "done" green for a few seconds first (that was jarring).
+        The DONE state is preserved for cockpit replay: when replay sends a
+        ``tool: "replay:..."`` payload we honour the explicit state request
+        so the green "done" replay still works.
+        """
         # Turn over: freeze session_duration_s at this turn's total until
         # the next UserPromptSubmit resets the clock.
         self._turn_active = False
-        used, tmax, _ = token_counter.count_tokens(
+        used, tmax, _, _, _ = token_counter.count_tokens(
             self.cfg.claude_dir, self._current_session,
             cwd=self._working_dir,
             model_limits=self.cfg.model_token_limits,
         )
         sdur = int(time.time() - self._session_start_ts) if self._session_start_ts > 0 else 0
+
+        # Cockpit replay forwards a tool name like "replay:done" — treat that
+        # as an explicit DONE request (preserves the green replay). A real
+        # Claude Code Stop has no such marker → go straight to IDLE.
+        tool = ""
+        tool_field = payload.get("tool", "")
+        if isinstance(tool_field, dict):
+            tool = tool_field.get("name", "")
+        else:
+            tool = str(tool_field)
+        is_replay = tool.startswith("replay:")
+
         new_status = ClaudeStatus(
-            state=ClaudeState.DONE,
+            state=ClaudeState.DONE if is_replay else ClaudeState.IDLE,
             tokens_used=used,
             tokens_max=tmax,
             model=self._current_model,
@@ -230,7 +253,7 @@ class Daemon:
         message text if the field is absent.
         """
         log.info("notification payload=%r", payload)
-        used, tmax, model = token_counter.count_tokens(
+        used, tmax, model, _, _ = token_counter.count_tokens(
             self.cfg.claude_dir, self._current_session,
             cwd=self._working_dir,
             model_limits=self.cfg.model_token_limits,

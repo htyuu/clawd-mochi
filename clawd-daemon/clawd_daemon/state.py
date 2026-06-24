@@ -86,13 +86,15 @@ class StateManager:
         now = time.time()
         new.updated_at = now
 
-        # If the current state has higher priority (e.g. ERROR while
-        # new is THINKING), only update non-state fields — but update
-        # ALL of them (model, git, tokens, session info), not just a few.
-        # Otherwise stale fields (e.g. model="sonnet") persist under DONE.
-        # The transient_since timer is NOT refreshed here, so a low-priority
-        # event arriving during ERROR/AWAITING/DONE does not extend its life.
-        if new.state < self._status.state:
+        # Only transient high-priority states should suppress lower-priority
+        # updates. THINKING is not transient: PostToolUse/Stop must be able to
+        # return it to IDLE immediately.
+        current_is_transient = self._status.state in (
+            ClaudeState.ERROR,
+            ClaudeState.AWAITING,
+            ClaudeState.DONE,
+        )
+        if current_is_transient and new.state < self._status.state:
             self._status.tool = new.tool
             self._status.task = new.task
             self._status.tokens_used = new.tokens_used

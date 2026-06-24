@@ -25,8 +25,8 @@ def count_tokens(
     model: str = "sonnet",
     cwd: str | None = None,
     model_limits: dict[str, int] | None = None,
-) -> tuple[int, int, str]:
-    """Return (context_used, context_max, model_name) for the session.
+) -> tuple[int, int, str, int, int]:
+    """Return (context_used, context_max, model_name, last_cost, last_cached).
 
     ``context_used`` is the **current context-window occupancy** — the input
     token count of the most recent request in the transcript
@@ -36,6 +36,18 @@ def count_tokens(
     across requests would double-count history and report a number far larger
     than the actual context window. The device progress bar divides this by
     ``context_max`` to show how full the window is.
+
+    ``last_cost`` is the **non-cached token cost of the most recent request**
+    — ``input_tokens + output_tokens + cache_creation_input_tokens``. These
+    are the tokens the model actually had to process fresh (cache misses +
+    output + new cache writes).
+
+    ``last_cached`` is the **cache-hit token count of the most recent
+    request** — ``cache_read_input_tokens``. The model still processes these
+    (they're the cached portion of the conversation history), but they were
+    served from cache rather than re-computed. The cockpit year page shows
+    ``last_cost`` and ``last_cached`` as two separate totals so you can see
+    how much of the conversation was cache hits vs fresh processing.
 
     ``context_max`` is the model's context-window size, resolved from
     ``model_limits`` (the daemon config's ``[model_token_limits]``) by exact
@@ -53,7 +65,7 @@ def count_tokens(
     limits = model_limits if model_limits is not None else DEFAULT_MODEL_LIMITS
 
     if not session_id:
-        return 0, _resolve_limit(model, limits), model
+        return 0, _resolve_limit(model, limits), model, 0, 0
 
     tokens_max = _resolve_limit(model, limits)
     detected_model = model
@@ -105,9 +117,12 @@ def count_tokens(
                 and not lines[0].startswith("{")):
             lines = lines[1:]
 
-        # Most recent context occupancy found in the tail. We keep the LAST
-        # usage record only (see docstring: summing would double-count history).
+        # Most recent context occupancy + cost split found in the tail. We
+        # keep the LAST usage record only (see docstring: summing would
+        # double-count history).
         last_context = 0
+        last_cost = 0
+        last_cached = 0
 
         for line in lines:
             line = line.strip()
@@ -140,19 +155,24 @@ def count_tokens(
             if not usage:
                 usage = obj.get("usage", {})
             if usage:
+                cache_read = usage.get("cache_read_input_tokens", 0)
+                cache_create = usage.get("cache_creation_input_tokens", 0)
+                inp = usage.get("input_tokens", 0)
+                out = usage.get("output_tokens", 0)
                 # Current context = the input tokens of this request. output
                 # tokens are NOT part of the input context window, so excluded.
-                last_context = (
-                    usage.get("input_tokens", 0)
-                    + usage.get("cache_read_input_tokens", 0)
-                    + usage.get("cache_creation_input_tokens", 0)
-                )
+                last_context = inp + cache_read + cache_create
+                # Non-cached cost = tokens processed fresh (cache misses +
+                # output + new cache writes).
+                last_cost = inp + out + cache_create
+                # Cached = cache-hit portion of the conversation history.
+                last_cached = cache_read
 
-        return last_context, tokens_max, detected_model
+        return last_context, tokens_max, detected_model, last_cost, last_cached
 
     if not matched:
         log.debug("no transcript file found for session %s", session_id)
-    return 0, tokens_max, detected_model
+    return 0, tokens_max, detected_model, 0, 0
 
 
 def _resolve_limit(

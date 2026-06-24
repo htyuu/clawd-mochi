@@ -25,6 +25,17 @@ def test_apply_keeps_higher_priority_state_but_updates_fields():
     assert sm.status.tokens_used == 500
 
 
+def test_apply_allows_thinking_to_return_to_idle():
+    sm = StateManager()
+    sm.apply(ClaudeStatus(state=ClaudeState.THINKING, tool="Bash"))
+
+    changed = sm.apply(ClaudeStatus(state=ClaudeState.IDLE))
+
+    assert changed is True
+    assert sm.status.state == ClaudeState.IDLE
+    assert sm.status.tool == ""
+
+
 def test_reset_returns_to_idle():
     sm = StateManager()
     sm.apply(ClaudeStatus(state=ClaudeState.ERROR))
